@@ -8,3 +8,8 @@ pub mod frame;
 pub mod lz4;
 pub mod pcdrv;
 pub mod proto;
+pub mod session;
+pub mod transport;
+
+pub use session::{LoadOptions, RunResult, Session, SessionError, Stop};
+pub use transport::{MemTransport, SerialTransport, Transport};
