@@ -1,0 +1,25 @@
+[package]
+name = "psxmon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host tool for the PS1 debug monitor: load, run, PCDRV, memory access"
+repository = "https://github.com/pcsx-redux/psxmon"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "psxmon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std"] }
+tokio-serial = "5.4"
+
+[dev-dependencies]
+lz4_flex = "0.11"
+tempfile = "3"

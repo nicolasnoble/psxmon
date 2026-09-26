@@ -1,0 +1,10 @@
+//! Host side of the PS1 debug monitor (`monitor/PROTOCOL.md`, protocol
+//! version 2): framing on a byte link, a session that loads and runs
+//! programs and serves their PCDRV calls, and the pieces it is built from.
+
+pub mod bios;
+pub mod exe;
+pub mod frame;
+pub mod lz4;
+pub mod pcdrv;
+pub mod proto;
