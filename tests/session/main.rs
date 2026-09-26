@@ -341,3 +341,39 @@ async fn timeout_when_target_never_stops() {
     assert_eq!(r.exit_code, None);
     assert!(t0.elapsed() >= Duration::from_millis(300));
 }
+
+#[tokio::test]
+async fn elf_and_cpe_images_load_and_run() {
+    // A CPE whose load chunks are contiguous goes out as one segment.
+    let text = program_text(5000);
+    let (first, second) = text.split_at(3000);
+    let mut cpe = b"CPE\x01\x08\x00\x03\x90\x00".to_vec();
+    cpe.extend(0x8001_0000u32.to_le_bytes());
+    for (addr, part) in [(0x8001_0000u32, first), (0x8001_0bb8, second)] {
+        cpe.push(0x01);
+        cpe.extend(addr.to_le_bytes());
+        cpe.extend(len32(part).to_le_bytes());
+        cpe.extend(part);
+    }
+    cpe.push(0x00);
+    let img = exe::parse(&cpe).expect("parse CPE");
+    assert_eq!(img.segments.len(), 1);
+    let prog = CheckAndExit {
+        addr: 0x8001_0000,
+        expect: text.clone(),
+        pc: 0x8001_0000,
+        gp: 0,
+        sp: exe::DEFAULT_STACK_ELF_CPE,
+        code: 5,
+        exit_at: 0x8001_2000,
+        started: false,
+    };
+    let (mut s, _) = attach(SimConfig::default(), Box::new(prog)).await;
+    for seg in &img.segments {
+        s.load(seg.addr, &seg.data, &LoadOptions::default())
+            .await
+            .expect("load");
+    }
+    s.run(img.pc, img.gp, img.sp).await.expect("RUN");
+    assert_eq!(run_until_stop(&mut s, 5, None).await.exit_code, Some(5));
+}

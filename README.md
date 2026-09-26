@@ -21,11 +21,18 @@ binary is a thin command line on top of it.
 `--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
 or `0x` hex.
 
-- `run` loads a PS-EXE, starts it, and copies its console text to stdout.
+- `run` loads a program, starts it, and copies its console text to stdout.
   It serves `break 0, 0x101..0x107` PCDRV calls from `--pcdrv DIR`, jailed
   to that directory. Without `--pcdrv`, every PCDRV call fails with -1. The
   run ends when the program executes `break 4, 0`, with its exit code in
   `a0`.
+- Programs can be PS-EXE, ELF or CPE, told apart by their magic. An ELF
+  loads its PT_LOAD segments at their physical addresses, minus the header
+  sections, and starts at `e_entry` with gp from `_gp`. A CPE loads its load
+  chunks and starts at register 0x90. ELF and CPE get sp 0x801FFF00.
+- LZ4 is used when the monitor advertises it and it shrinks the program. The
+  compressor caps every match at `--max-match` bytes, because the monitor
+  decodes while it receives and cannot pause the sender inside a frame.
 - `--fast-reload 9` switches SIO1 to 230400 baud after attaching (SET_BAUD
   with its two-PING confirmation). If the new rate does not answer, psxmon
   falls back to the old one. The monitor keeps the new rate, so later

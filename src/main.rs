@@ -51,7 +51,7 @@ struct Link {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Program to run (PS-EXE).
+    /// Program to run (PS-EXE, ELF or CPE).
     file: PathBuf,
     #[command(flatten)]
     link: Link,
