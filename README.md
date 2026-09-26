@@ -56,6 +56,14 @@ without exiting (a fault or another breakpoint).
     cargo build --release
     cargo test
 
+The toolchain is stable Rust (`rust-toolchain.toml`). CI runs `cargo fmt`,
+`cargo clippy` with the lint set in `Cargo.toml`, the tests, and release
+builds for Linux, Windows and macOS.
+
+The tests run the session against a simulated monitor (`tests/sim`). The
+simulator speaks the byte-stream protocol with 2 MiB of RAM, registers,
+SET_BAUD and a scripted target that makes PCDRV and exit breaks.
+
 ## License
 
 MIT, see `LICENSE`.
