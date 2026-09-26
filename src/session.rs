@@ -256,6 +256,27 @@ impl<T: Transport> Session<T> {
         Ok(false)
     }
 
+    /// Attach at the first of `rates` where the monitor answers PING: the
+    /// first rate gets `first_wait`, each other one `other_wait`. A monitor
+    /// left at a fast rate by an earlier SET_BAUD does not answer at the
+    /// boot rate. Returns the rate that answered, with the transport at it.
+    pub async fn attach_at(
+        &mut self,
+        rates: &[u32],
+        first_wait: Duration,
+        other_wait: Duration,
+    ) -> Result<Option<u32>> {
+        let mut wait = first_wait;
+        for &rate in rates {
+            self.io.set_baud_rate(rate)?;
+            if self.ping(wait, &[]).await? {
+                return Ok(Some(rate));
+            }
+            wait = other_wait;
+        }
+        Ok(None)
+    }
+
     /// Write `data` at `addr` in plain LOAD frames of 8 KiB, each ACKed
     /// before the next.
     pub async fn load_raw(&mut self, addr: u32, data: &[u8]) -> Result<()> {

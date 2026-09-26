@@ -118,17 +118,33 @@ fn seconds(secs: f64, what: &str) -> Result<Duration> {
     Duration::try_from_secs_f64(secs).with_context(|| format!("{what}: bad number of seconds"))
 }
 
+/// How long to PING at each rate other than --baud before trying the next.
+const PROBE_WAIT: Duration = Duration::from_secs(1);
+
 async fn attach(link: &Link) -> Result<Session<SerialTransport>> {
     let io = SerialTransport::open(&link.port, link.baud)
         .with_context(|| format!("opening {}", link.port))?;
     let mut s = Session::new(io);
-    let wait = seconds(link.attach_timeout, "--attach-timeout")?;
-    if !s.ping(wait, &[]).await? {
+    // A monitor an earlier SET_BAUD left at a faster rate does not answer at
+    // --baud, so fall back to the rates it can have been left at: the boot
+    // rate, 230400 (reload 9), and whatever --fast-reload names.
+    let mut rates = vec![link.baud, proto::sio1_rate(18), proto::sio1_rate(9)];
+    rates.extend(link.fast_reload.map(proto::sio1_rate));
+    let mut seen = Vec::new();
+    rates.retain(|r| {
+        let fresh = !seen.contains(r);
+        seen.push(*r);
+        fresh
+    });
+    let first_wait = seconds(link.attach_timeout, "--attach-timeout")?;
+    let Some(rate) = s.attach_at(&rates, first_wait, PROBE_WAIT).await? else {
         bail!(
-            "no PONG from the monitor on {} at {} baud",
-            link.port,
-            link.baud
+            "no PONG from the monitor on {} at {rates:?} baud",
+            link.port
         );
+    };
+    if rate != link.baud {
+        eprintln!("psxmon: monitor answered at {rate} baud, not {}", link.baud);
     }
     // Anything before the first PONG is boot or line noise, not program text.
     s.take_text();

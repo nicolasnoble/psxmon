@@ -37,6 +37,9 @@ or `0x` hex.
   with its two-PING confirmation). If the new rate does not answer, psxmon
   falls back to the old one. The monitor keeps the new rate, so later
   commands need `--baud 230400`.
+- If the monitor does not answer at `--baud`, psxmon tries 115200, 230400
+  and the `--fast-reload` rate, in that order. It says on stderr which rate
+  answered.
 - `ping` prints the protocol version, the capability bits, and the BIOS
   checksum with its name from a table of retail BIOS images.
 

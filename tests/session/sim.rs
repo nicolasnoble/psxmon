@@ -105,6 +105,8 @@ pub struct SimConfig {
     pub window: Duration,
     /// Switch to a rate the host can never match (to exercise the fallback).
     pub unreachable_rate: bool,
+    /// The rate the sim listens at from the start (default: the host's).
+    pub start_rate: Option<u32>,
 }
 
 impl Default for SimConfig {
@@ -115,6 +117,7 @@ impl Default for SimConfig {
             legacy_exit: false,
             window: Duration::from_millis(400),
             unreachable_rate: false,
+            start_rate: None,
         }
     }
 }
@@ -159,7 +162,9 @@ impl Sim {
         cfg: SimConfig,
         program: Box<dyn Program>,
     ) -> (Sim, Arc<Mutex<SimStats>>) {
-        let rate = host_rate.load(Ordering::SeqCst);
+        let rate = cfg
+            .start_rate
+            .unwrap_or_else(|| host_rate.load(Ordering::SeqCst));
         let stats = Arc::new(Mutex::new(SimStats {
             rate,
             ..Default::default()

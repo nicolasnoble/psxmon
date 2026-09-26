@@ -272,6 +272,61 @@ async fn set_baud_falls_back_when_new_rate_is_silent() {
 }
 
 #[tokio::test]
+async fn attach_finds_a_monitor_left_at_230400() {
+    // An earlier run's SET_BAUD left the monitor at 230400; the host asks
+    // for 115200 first.
+    let cfg = SimConfig {
+        start_rate: Some(230400),
+        ..Default::default()
+    };
+    let (host, _stats) = sim::start(cfg, Box::new(Hang));
+    let mut s = Session::new(host);
+    let rates = [115200, 230400];
+    let t0 = Instant::now();
+    let found = s
+        .attach_at(
+            &rates,
+            Duration::from_millis(600),
+            Duration::from_millis(600),
+        )
+        .await
+        .expect("attach");
+    assert_eq!(found, Some(230400));
+    assert!(
+        t0.elapsed() >= Duration::from_millis(600),
+        "115200 was tried first"
+    );
+    assert_eq!(s.transport().baud_rate(), 230400);
+    assert_eq!((s.caps, s.bios), (CAP_LZ4, Some(BIOS)));
+    // And the link works at that rate.
+    let data = program_text(10000);
+    s.write_mem(0x8002_0000, &data).await.expect("WRITE_MEM");
+    assert_eq!(
+        s.read_mem(0x8002_0000, len32(&data))
+            .await
+            .expect("READ_MEM"),
+        data
+    );
+    // Nothing answers at rates the monitor is not on.
+    let (host, _) = sim::start(
+        SimConfig {
+            start_rate: Some(57600),
+            ..Default::default()
+        },
+        Box::new(Hang),
+    );
+    let mut s = Session::new(host);
+    let none = s
+        .attach_at(
+            &rates,
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert_eq!(none.expect("attach runs"), None);
+}
+
+#[tokio::test]
 async fn memory_regs_and_errors() {
     let (mut s, stats) = attach(SimConfig::default(), Box::new(Hang)).await;
     // Across several DATA frames, an odd length, and len 0.
