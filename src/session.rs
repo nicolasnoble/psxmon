@@ -10,8 +10,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, sleep, timeout_at};
 
-use crate::frame::{Event, Frame, Parser, bytes_to_words, encode_frame, u32_words, word_u32, words_to_bytes};
-use crate::lz4;
+use crate::frame::{
+    Event, Frame, FrameError, Parser, bytes_to_words, encode_frame, u32_words, word_u32,
+    words_to_bytes,
+};
+use crate::lz4::{self, DecodeError};
 use crate::pcdrv::PcdrvServer;
 use crate::proto::{self, *};
 use crate::transport::Transport;
@@ -28,6 +31,14 @@ const RATE_WINDOW: Duration = Duration::from_millis(2500);
 const SHORT: Duration = Duration::from_secs(2);
 const BULK: Duration = Duration::from_secs(5);
 
+/// `now + d`, or far in the future if that does not fit.
+pub fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 3600)))
+        .unwrap_or(now)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
@@ -40,11 +51,25 @@ pub enum SessionError {
     Monitor { what: String, code: u16 },
     #[error("monitor: {0}: reply failed its checksum")]
     Checksum(String),
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+    #[error("LZ4: {0}")]
+    Lz4(#[from] DecodeError),
+    #[error("{0} does not fit in the protocol's 32-bit field")]
+    TooLarge(&'static str),
     #[error("monitor: {0}")]
     Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
+
+fn u32_len(n: usize, what: &'static str) -> Result<u32> {
+    u32::try_from(n).map_err(|_| SessionError::TooLarge(what))
+}
+
+fn to_usize(n: u32) -> Result<usize> {
+    usize::try_from(n).map_err(|_| SessionError::TooLarge("length"))
+}
 
 /// A STOPPED event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +177,7 @@ impl<T: Transport> Session<T> {
     }
 
     pub async fn send(&mut self, ty: u16, payload: &[u16]) -> Result<()> {
-        self.io.write_all(&encode_frame(ty, payload)).await?;
+        self.io.write_all(&encode_frame(ty, payload)?).await?;
         self.io.flush().await?;
         Ok(())
     }
@@ -185,9 +210,9 @@ impl<T: Transport> Session<T> {
                 return Ok(None);
             }
             match timeout_at(deadline, self.io.read(&mut buf)).await {
-                Err(_) => continue,
+                Err(_) => {}
                 Ok(Ok(0)) => return Err(SessionError::Closed),
-                Ok(Ok(n)) => self.parser.feed(&buf[..n]),
+                Ok(Ok(n)) => self.parser.feed(buf.get(..n).unwrap_or_default()),
                 Ok(Err(e)) => return Err(e.into()),
             }
         }
@@ -195,7 +220,7 @@ impl<T: Transport> Session<T> {
 
     /// ACK, or the ERROR / timeout / checksum failure as an error.
     async fn expect_ack(&mut self, what: impl Fn() -> String, wait: Duration) -> Result<()> {
-        match self.wait_frame(&[ACK, ERROR], Instant::now() + wait).await? {
+        match self.wait_frame(&[ACK, ERROR], deadline_after(wait)).await? {
             None => Err(SessionError::Timeout(what())),
             Some(f) if f.ty == ERROR => Err(SessionError::Monitor {
                 what: what(),
@@ -209,18 +234,18 @@ impl<T: Transport> Session<T> {
     /// PING until PONG, or false after `wait`. A PONG with only the version
     /// (the SET_BAUD window PONGs) leaves caps and BIOS as they were.
     pub async fn ping(&mut self, wait: Duration, payload: &[u16]) -> Result<bool> {
-        let deadline = Instant::now() + wait;
+        let deadline = deadline_after(wait);
         while Instant::now() < deadline {
             self.send(PING, payload).await?;
-            let slot = deadline.min(Instant::now() + Duration::from_millis(500));
+            let slot = deadline.min(deadline_after(Duration::from_millis(500)));
             if let Some(pong) = self.wait_frame(&[PONG], slot).await?
                 && pong.ok
             {
                 if let Some(&v) = pong.words.first() {
                     self.version = Some(v);
                 }
-                if pong.words.len() > 1 {
-                    self.caps = pong.words[1];
+                if let Some(&caps) = pong.words.get(1) {
+                    self.caps = caps;
                 }
                 if pong.words.len() > 3 {
                     self.bios = Some(word_u32(&pong.words, 2));
@@ -243,12 +268,18 @@ impl<T: Transport> Session<T> {
     }
 
     async fn bulk_write(&mut self, ty: u16, name: &str, addr: u32, data: &[u8]) -> Result<()> {
-        for (i, chunk) in data.chunks(CHUNK_BYTES).enumerate() {
-            let at = addr.wrapping_add((i * CHUNK_BYTES) as u32);
-            let mut payload = u32_words(&[at, chunk.len() as u32]);
+        u32_len(data.len(), "write length")?;
+        let mut at = addr;
+        for chunk in data.chunks(CHUNK_BYTES) {
+            let n = u32_len(chunk.len(), "chunk")?;
+            let mut payload = u32_words(&[at, n]);
             payload.extend(bytes_to_words(chunk));
             self.send(ty, &payload).await?;
-            self.expect_ack(|| format!("{name} at 0x{at:08x}"), BULK).await?;
+            self.expect_ack(|| format!("{name} at 0x{at:08x}"), BULK)
+                .await?;
+            // Target addresses are 32-bit and wrap, as `addr + off` does
+            // once the reference host packs it into two words.
+            at = at.wrapping_add(n);
         }
         Ok(())
     }
@@ -256,12 +287,18 @@ impl<T: Transport> Session<T> {
     /// Write `raw_len` bytes at `addr` from the LZ4 block `comp`, sent as
     /// consecutive slices in LOAD|LZ4 frames, each ACKed before the next.
     pub async fn load_lz4(&mut self, addr: u32, raw_len: usize, comp: &[u8]) -> Result<()> {
-        for (i, chunk) in comp.chunks(CHUNK_BYTES).enumerate() {
-            let off = (i * CHUNK_BYTES) as u32;
-            let mut payload = u32_words(&[addr, raw_len as u32, comp.len() as u32, off, chunk.len() as u32]);
+        let raw_len = u32_len(raw_len, "LZ4 raw length")?;
+        let clen = u32_len(comp.len(), "LZ4 block")?;
+        let mut off: u32 = 0;
+        for chunk in comp.chunks(CHUNK_BYTES) {
+            let n = u32_len(chunk.len(), "chunk")?;
+            let mut payload = u32_words(&[addr, raw_len, clen, off, n]);
             payload.extend(bytes_to_words(chunk));
             self.send(LOAD | LZ4_FLAG, &payload).await?;
-            self.expect_ack(|| format!("LZ4 LOAD at offset {off}"), BULK).await?;
+            self.expect_ack(|| format!("LZ4 LOAD at offset {off}"), BULK)
+                .await?;
+            // off + n <= clen, a u32.
+            off = off.saturating_add(n);
         }
         Ok(())
     }
@@ -270,8 +307,10 @@ impl<T: Transport> Session<T> {
     /// shrinks the data enough; plain LOAD otherwise.
     pub async fn load(&mut self, addr: u32, data: &[u8], opts: &LoadOptions) -> Result<LoadStats> {
         if opts.lz4 && self.caps & CAP_LZ4 != 0 && !data.is_empty() {
-            let comp = lz4::compress(data, opts.max_match);
-            if (comp.len() as f64) < data.len() as f64 * opts.max_ratio {
+            let comp = lz4::compress(data, opts.max_match)?;
+            let comp_len = f64::from(u32_len(comp.len(), "LZ4 block")?);
+            let raw_len = f64::from(u32_len(data.len(), "load length")?);
+            if comp_len < raw_len * opts.max_ratio {
                 self.load_lz4(addr, data.len(), &comp).await?;
                 return Ok(LoadStats {
                     bytes: data.len(),
@@ -288,10 +327,14 @@ impl<T: Transport> Session<T> {
 
     pub async fn read_mem(&mut self, addr: u32, len: u32) -> Result<Vec<u8>> {
         self.send(READ_MEM, &u32_words(&[addr, len])).await?;
-        let mut out = Vec::with_capacity(len as usize);
+        let want = to_usize(len)?;
+        let mut out = Vec::with_capacity(want);
         loop {
             let what = || format!("READ_MEM at 0x{addr:08x}");
-            let f = match self.wait_frame(&[DATA, ERROR], Instant::now() + BULK).await? {
+            let f = match self
+                .wait_frame(&[DATA, ERROR], deadline_after(BULK))
+                .await?
+            {
                 None => return Err(SessionError::Timeout(what())),
                 Some(f) if f.ty == ERROR => {
                     return Err(SessionError::Monitor {
@@ -302,10 +345,10 @@ impl<T: Transport> Session<T> {
                 Some(f) if !f.ok => return Err(SessionError::Checksum(what())),
                 Some(f) => f,
             };
-            let n = word_u32(&f.words, 0) as usize;
+            let n = to_usize(word_u32(&f.words, 0))?;
             out.extend(words_to_bytes(&f.words, 2, n));
             // len 0 is answered by one empty DATA frame.
-            if out.len() >= len as usize {
+            if out.len() >= want {
                 return Ok(out);
             }
         }
@@ -313,8 +356,17 @@ impl<T: Transport> Session<T> {
 
     pub async fn get_regs(&mut self) -> Result<[u32; NUM_REGS]> {
         self.send(GET_REGS, &[]).await?;
-        match self.wait_frame(&[REGS, ERROR], Instant::now() + SHORT).await? {
-            Some(f) if f.ty == REGS && f.ok => Ok(std::array::from_fn(|i| word_u32(&f.words, 2 * i))),
+        match self
+            .wait_frame(&[REGS, ERROR], deadline_after(SHORT))
+            .await?
+        {
+            Some(f) if f.ty == REGS && f.ok => {
+                let mut regs = [0u32; NUM_REGS];
+                for (r, pair) in regs.iter_mut().zip(f.words.chunks_exact(2)) {
+                    *r = word_u32(pair, 0);
+                }
+                Ok(regs)
+            }
             Some(f) if f.ty == ERROR => Err(SessionError::Monitor {
                 what: "GET_REGS".into(),
                 code: f.words.first().copied().unwrap_or(0),
@@ -349,7 +401,7 @@ impl<T: Transport> Session<T> {
         let old = self.io.baud_rate();
         self.send(SET_BAUD, &[reload]).await?;
         match self
-            .wait_frame(&[ACK, ERROR], Instant::now() + Duration::from_secs(1))
+            .wait_frame(&[ACK, ERROR], deadline_after(Duration::from_secs(1)))
             .await?
         {
             Some(f) if f.ty == ACK => {}
@@ -366,7 +418,9 @@ impl<T: Transport> Session<T> {
         sleep(RATE_WINDOW).await;
         self.take_text();
         if !self.ping(Duration::from_secs(3), &[]).await? {
-            return Err(SessionError::Other(format!("lost after trying reload {reload}")));
+            return Err(SessionError::Other(format!(
+                "lost after trying reload {reload}"
+            )));
         }
         // Whatever a garbled PONG decoded to is not console text.
         self.take_text();
@@ -385,7 +439,7 @@ impl<T: Transport> Session<T> {
         mut pcdrv: Option<&mut PcdrvServer>,
     ) -> Result<RunResult> {
         loop {
-            let slot = deadline.min(Instant::now() + Duration::from_millis(50));
+            let slot = deadline.min(deadline_after(Duration::from_millis(50)));
             if let Some(f) = self.wait_frame(&[STOPPED], slot).await? {
                 let stop = Stop {
                     reason: f.words.first().copied().unwrap_or(0),
@@ -393,11 +447,15 @@ impl<T: Transport> Session<T> {
                     a: word_u32(&f.words, 3),
                     b: word_u32(&f.words, 5),
                 };
-                let insn = if stop.reason == STOP_BREAKPOINT { stop.a } else { 0 };
+                let insn = if stop.reason == STOP_BREAKPOINT {
+                    stop.a
+                } else {
+                    0
+                };
                 if let Some(code) = BreakCode::decode(insn) {
                     if code.is_exit() {
                         let regs = self.get_regs().await?;
-                        let a0 = regs[REG_A0 as usize];
+                        let a0 = regs.get(usize::from(REG_A0)).copied().unwrap_or(0);
                         return Ok(RunResult {
                             stop: Some(Stop {
                                 reason: STOP_EXIT,
@@ -431,13 +489,20 @@ impl<T: Transport> Session<T> {
     /// Serve a PCDRV call the target made with `break 0, op`: arguments from
     /// its registers and memory, the result back in v0/v1 (v0 alone for init
     /// and close), then resume past the break.
-    async fn serve_pcdrv(&mut self, op: u32, epc: u32, pcdrv: Option<&mut PcdrvServer>) -> Result<()> {
-        let r = self.get_regs().await?;
-        let a = |i: u16| r[(REG_A0 + i) as usize];
-        let (a0, a1, a2, a3) = (a(0), a(1), a(2), a(3));
+    async fn serve_pcdrv(
+        &mut self,
+        op: u32,
+        epc: u32,
+        pcdrv: Option<&mut PcdrvServer>,
+    ) -> Result<()> {
+        let regs = self.get_regs().await?;
+        let &[a0, a1, a2, a3] = regs
+            .get(usize::from(REG_A0)..)
+            .and_then(|r| r.first_chunk::<4>())
+            .ok_or_else(|| SessionError::Other("REGS too short".into()))?;
         let ret = match pcdrv {
             None => -1,
-            Some(server) => match self.pcdrv_call(server, op, a0, a1, a2, a3).await {
+            Some(server) => match self.pcdrv_call(server, op, [a0, a1, a2, a3]).await {
                 Ok(v) => v,
                 Err(e) => {
                     if self.verbose {
@@ -448,61 +513,63 @@ impl<T: Transport> Session<T> {
             },
         };
         if self.verbose {
-            eprintln!("psxmon: pcdrv 0x{op:03x} a0={a0:#x} a1={a1:#x} a2={a2:#x} a3={a3:#x} -> {ret}");
+            eprintln!(
+                "psxmon: pcdrv 0x{op:03x} a0={a0:#x} a1={a1:#x} a2={a2:#x} a3={a3:#x} -> {ret}"
+            );
         }
+        // The result goes back as the register's bit pattern.
         if op == PC_INIT || op == PC_CLOSE {
-            self.set_reg(REG_V0, ret as u32).await?;
+            self.set_reg(REG_V0, ret.cast_unsigned()).await?;
         } else {
             self.set_reg(REG_V0, 0).await?;
-            self.set_reg(REG_V1, ret as u32).await?;
+            self.set_reg(REG_V1, ret.cast_unsigned()).await?;
         }
+        // Past the break; PCs are 32-bit and wrap like the CPU's.
         self.set_reg(REG_PC, epc.wrapping_add(4)).await?;
         self.cont().await
     }
 
+    /// One PCDRV call. Handles and offsets arrive as register bits and are
+    /// read as the signed ints the target's pcdrv.h passes.
     async fn pcdrv_call(
         &mut self,
         s: &mut PcdrvServer,
         op: u32,
-        a0: u32,
-        a1: u32,
-        a2: u32,
-        a3: u32,
+        [a0, a1, a2, a3]: [u32; 4],
     ) -> std::result::Result<i32, CallError> {
         Ok(match op {
             PC_INIT => 0,
             PC_CREAT | PC_OPEN => {
                 let raw = self.read_mem(a0, PCDRV_NAME_MAX).await?;
-                let name = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+                let name = raw.split(|&b| b == 0).next().unwrap_or_default();
                 if op == PC_CREAT {
                     s.create(name)?
                 } else {
                     s.open(name, a2)?
                 }
             }
-            PC_CLOSE => s.close(a0 as i32),
+            PC_CLOSE => s.close(a0.cast_signed()),
             PC_READ => {
-                let data = s.read(a1 as i32, a2)?;
+                let data = s.read(a1.cast_signed(), a2)?;
                 if !data.is_empty() {
                     self.write_mem(a3, &data).await?;
                 }
-                data.len() as i32
+                i32::try_from(data.len()).map_err(|_| SessionError::TooLarge("PCread result"))?
             }
             PC_WRITE => {
-                let len = a2 as i32;
-                if len < 0 {
+                if a2.cast_signed() < 0 {
                     -1
                 } else {
-                    s.check_write(a1 as i32, len as u64)?;
-                    let data = if len > 0 {
-                        self.read_mem(a3, len as u32).await?
+                    s.check_write(a1.cast_signed(), u64::from(a2))?;
+                    let data = if a2 > 0 {
+                        self.read_mem(a3, a2).await?
                     } else {
                         Vec::new()
                     };
-                    s.write(a1 as i32, &data)?
+                    s.write(a1.cast_signed(), &data)?
                 }
             }
-            PC_LSEEK => s.seek(a0 as i32, a2 as i32, a3)?,
+            PC_LSEEK => s.seek(a0.cast_signed(), a2.cast_signed(), a3)?,
             _ => -1,
         })
     }

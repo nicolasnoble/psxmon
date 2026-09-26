@@ -1,14 +1,15 @@
 //! Session behaviour against the simulated monitor.
+#![cfg(test)]
 
 mod sim;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use psxmon::exe;
 use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::*;
-use psxmon::session::{LoadOptions, Session};
+use psxmon::session::{LoadOptions, Session, deadline_after};
 use psxmon::{MemTransport, Transport};
 use sim::*;
 use tokio::io::AsyncWriteExt;
@@ -16,12 +17,26 @@ use tokio::time::Instant;
 
 const BIOS: u32 = 0xbf38df5e;
 
-async fn attach(cfg: SimConfig, program: Box<dyn Program>) -> (Session<MemTransport>, Arc<Mutex<SimStats>>) {
+async fn attach(
+    cfg: SimConfig,
+    program: Box<dyn Program>,
+) -> (Session<MemTransport>, Arc<Mutex<SimStats>>) {
     let (host, stats) = sim::start(cfg, program);
     let mut s = Session::new(host);
-    assert!(s.ping(Duration::from_secs(2), &[]).await.unwrap(), "no PONG");
+    assert!(
+        s.ping(Duration::from_secs(2), &[]).await.expect("ping"),
+        "no PONG"
+    );
     assert_eq!(s.version, Some(PROTO_VER));
     (s, stats)
+}
+
+fn lock(stats: &Arc<Mutex<SimStats>>) -> MutexGuard<'_, SimStats> {
+    stats.lock().expect("sim stats lock")
+}
+
+fn len32(data: &[u8]) -> u32 {
+    u32::try_from(data.len()).expect("test data fits u32")
 }
 
 /// Code-like bytes that compress but not trivially.
@@ -30,22 +45,36 @@ fn program_text(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| {
             x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [_, _, _, noise] = x.to_le_bytes();
+            let [low, ..] = (i % 16).to_le_bytes();
             if (i / 512) % 3 == 0 {
                 0
             } else if (i / 64) % 2 == 0 {
-                (i % 16) as u8
+                low
             } else {
-                (x >> 24) as u8
+                noise
             }
         })
         .collect()
 }
 
+async fn run_until_stop(
+    s: &mut Session<MemTransport>,
+    secs: u64,
+    pcdrv: Option<&mut PcdrvServer>,
+) -> psxmon::RunResult {
+    s.run_until_stop(deadline_after(Duration::from_secs(secs)), pcdrv)
+        .await
+        .expect("run")
+}
+
 async fn load_run_exit(lz4: bool) {
     let text = program_text(100_000);
-    let file = exe::build_ps_exe(&text, 0x8001_0000, 0x8001_0000, 0x8009_0000, 0x801f_0000);
-    let img = exe::parse(&file).unwrap();
-    let seg = img.segments[0].clone();
+    let file = exe::build_ps_exe(&text, 0x8001_0000, 0x8001_0000, 0x8009_0000, 0x801f_0000)
+        .expect("build PS-EXE");
+    let img = exe::parse(&file).expect("parse PS-EXE");
+    let seg = img.segments.first().expect("one segment").clone();
+    let exit_at = img.pc.checked_add(0x100).expect("small");
     let prog = CheckAndExit {
         addr: seg.addr,
         expect: seg.data.clone(),
@@ -53,6 +82,7 @@ async fn load_run_exit(lz4: bool) {
         gp: img.gp,
         sp: img.sp,
         code: 42,
+        exit_at,
         started: false,
     };
     let (mut s, stats) = attach(SimConfig::default(), Box::new(prog)).await;
@@ -62,23 +92,24 @@ async fn load_run_exit(lz4: bool) {
         lz4,
         ..Default::default()
     };
-    let st = s.load(seg.addr, &seg.data, &opts).await.unwrap();
+    let st = s.load(seg.addr, &seg.data, &opts).await.expect("load");
     assert_eq!(st.lz4_bytes.is_some(), lz4);
-    s.run(img.pc, img.gp, img.sp).await.unwrap();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_secs(5), None)
-        .await
-        .unwrap();
+    s.run(img.pc, img.gp, img.sp).await.expect("RUN");
+    let r = run_until_stop(&mut s, 5, None).await;
     assert_eq!(r.exit_code, Some(42));
-    let stop = r.stop.unwrap();
+    let stop = r.stop.expect("stopped");
     assert_eq!(stop.reason, STOP_EXIT);
-    assert_eq!(stop.epc, img.pc + 0x100);
+    assert_eq!(stop.epc, exit_at);
     assert_eq!(s.take_text(), b"target: hello\n");
-    let st = stats.lock().unwrap();
+    let st = lock(&stats);
     if lz4 {
         assert!(st.lz4_frames >= 2, "lz4 frames {}", st.lz4_frames);
         assert_eq!(st.plain_load_frames, 0);
-        assert!(st.max_match > 0 && st.max_match <= 128, "max match {}", st.max_match);
+        assert!(
+            st.max_match > 0 && st.max_match <= 128,
+            "max match {}",
+            st.max_match
+        );
     } else {
         assert_eq!(st.lz4_frames, 0);
         assert_eq!(st.plain_load_frames, seg.data.len().div_ceil(8192));
@@ -107,40 +138,35 @@ async fn lz4_falls_back_to_plain_without_cap() {
     let st = s
         .load(0x8001_0000, &[0u8; 20000], &LoadOptions::default())
         .await
-        .unwrap();
+        .expect("load");
     assert_eq!(st.lz4_bytes, None);
-    assert_eq!(stats.lock().unwrap().plain_load_frames, 3);
+    assert_eq!(lock(&stats).plain_load_frames, 3);
 }
 
 async fn farmjob(lz4: bool, size: usize) {
-    let dir = tempfile::tempdir().unwrap();
-    let input: Vec<u8> = (0..size).map(|i| b"abcdefghijklmnopqrstuvwxyz\n"[i % 27]).collect();
-    std::fs::write(dir.path().join("IN.TXT"), &input).unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(size)
+        .collect();
+    std::fs::write(dir.path().join("IN.TXT"), &input).expect("write IN.TXT");
     let (mut s, _stats) = attach(SimConfig::default(), Box::new(Farmjob::new())).await;
     // A stand-in body so the load path runs too.
     let body = program_text(30_000);
-    s.load(
-        0x8001_0000,
-        &body,
-        &LoadOptions {
-            lz4,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let mut server = PcdrvServer::new(dir.path(), Quota::default()).unwrap();
-    s.run(0x8001_0000, 0, 0x801f_fff0).await.unwrap();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_secs(10), Some(&mut server))
-        .await
-        .unwrap();
-    assert_eq!(r.exit_code, Some(size as u32));
-    assert_eq!(
-        std::fs::read(dir.path().join("OUT.TXT")).unwrap(),
-        input.to_ascii_uppercase()
-    );
-    let text = String::from_utf8(s.take_text()).unwrap();
+    let opts = LoadOptions {
+        lz4,
+        ..Default::default()
+    };
+    s.load(0x8001_0000, &body, &opts).await.expect("load");
+    let mut server = PcdrvServer::new(dir.path(), Quota::default()).expect("PCDRV server");
+    s.run(0x8001_0000, 0, 0x801f_fff0).await.expect("RUN");
+    let r = run_until_stop(&mut s, 10, Some(&mut server)).await;
+    assert_eq!(r.exit_code, Some(len32(&input)));
+    let out = std::fs::read(dir.path().join("OUT.TXT")).expect("OUT.TXT written");
+    assert_eq!(out, input.to_ascii_uppercase());
+    let text = String::from_utf8(s.take_text()).expect("ASCII console text");
     assert_eq!(text, format!("farmjob: start\nfarmjob: {size} bytes\n"));
 }
 
@@ -163,33 +189,24 @@ async fn pcdrv_farmjob_small_and_exact_chunk() {
 #[tokio::test]
 async fn pcdrv_without_server_fails_calls() {
     let (mut s, _) = attach(SimConfig::default(), Box::new(Farmjob::new())).await;
-    s.run(0x8001_0000, 0, 0x801f_fff0).await.unwrap();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_secs(5), None)
-        .await
-        .unwrap();
+    s.run(0x8001_0000, 0, 0x801f_fff0).await.expect("RUN");
+    let r = run_until_stop(&mut s, 5, None).await;
     assert_eq!(r.exit_code, Some(0xbad));
 }
 
 #[tokio::test]
 async fn pcdrv_jail_refuses_escape() {
-    let outer = tempfile::tempdir().unwrap();
+    let outer = tempfile::tempdir().expect("tempdir");
     let base = outer.path().join("jail");
-    std::fs::create_dir(&base).unwrap();
-    let (mut s, _) = attach(
-        SimConfig::default(),
-        Box::new(JailProbe {
-            name: b"..\\escaped.txt",
-            phase: 0,
-        }),
-    )
-    .await;
-    let mut server = PcdrvServer::new(&base, Quota::default()).unwrap();
-    s.run(0x8001_0000, 0, 0x801f_fff0).await.unwrap();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_secs(5), Some(&mut server))
-        .await
-        .unwrap();
+    std::fs::create_dir(&base).expect("jail dir");
+    let probe = JailProbe {
+        name: b"..\\escaped.txt",
+        done: false,
+    };
+    let (mut s, _) = attach(SimConfig::default(), Box::new(probe)).await;
+    let mut server = PcdrvServer::new(&base, Quota::default()).expect("PCDRV server");
+    s.run(0x8001_0000, 0, 0x801f_fff0).await.expect("RUN");
+    let r = run_until_stop(&mut s, 5, Some(&mut server)).await;
     assert_eq!(r.exit_code, Some(u32::MAX));
     assert!(!outer.path().join("escaped.txt").exists());
 }
@@ -207,16 +224,14 @@ async fn legacy_exit_reason_maps_to_exit_code() {
         gp: 0,
         sp: 0x801f_fff0,
         code: 7,
+        exit_at: 0x8001_0100,
         started: false,
     };
     let (mut s, _) = attach(cfg, Box::new(prog)).await;
-    s.run(0x8001_0000, 0, 0x801f_fff0).await.unwrap();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_secs(5), None)
-        .await
-        .unwrap();
+    s.run(0x8001_0000, 0, 0x801f_fff0).await.expect("RUN");
+    let r = run_until_stop(&mut s, 5, None).await;
     assert_eq!(r.exit_code, Some(7));
-    let stop = r.stop.unwrap();
+    let stop = r.stop.expect("stopped");
     assert_eq!(stop.reason, STOP_EXIT);
     assert_eq!(stop.a, 7);
 }
@@ -225,16 +240,21 @@ async fn legacy_exit_reason_maps_to_exit_code() {
 async fn set_baud_short_pong_keeps_caps_and_bios() {
     let (mut s, stats) = attach(SimConfig::default(), Box::new(Hang)).await;
     assert_eq!((s.caps, s.bios), (CAP_LZ4, Some(BIOS)));
-    let rate = s.negotiate_rate(9).await.unwrap();
+    let rate = s.negotiate_rate(9).await.expect("SET_BAUD");
     assert_eq!(rate, 230400);
     assert_eq!(s.transport().baud_rate(), 230400);
-    assert_eq!(stats.lock().unwrap().rate, 230400);
+    assert_eq!(lock(&stats).rate, 230400);
     // The two window PONGs carried only [proto_ver].
     assert_eq!((s.caps, s.bios), (CAP_LZ4, Some(BIOS)));
-    assert!(s.ping(Duration::from_secs(1), &[]).await.unwrap());
+    assert!(s.ping(Duration::from_secs(1), &[]).await.expect("ping"));
     let data = program_text(20000);
-    s.write_mem(0x8002_0000, &data).await.unwrap();
-    assert_eq!(s.read_mem(0x8002_0000, data.len() as u32).await.unwrap(), data);
+    s.write_mem(0x8002_0000, &data).await.expect("WRITE_MEM");
+    assert_eq!(
+        s.read_mem(0x8002_0000, len32(&data))
+            .await
+            .expect("READ_MEM"),
+        data
+    );
 }
 
 #[tokio::test]
@@ -244,10 +264,10 @@ async fn set_baud_falls_back_when_new_rate_is_silent() {
         ..Default::default()
     };
     let (mut s, stats) = attach(cfg, Box::new(Hang)).await;
-    let rate = s.negotiate_rate(9).await.unwrap();
+    let rate = s.negotiate_rate(9).await.expect("SET_BAUD");
     assert_eq!(rate, 115200);
     assert_eq!(s.transport().baud_rate(), 115200);
-    assert_eq!(stats.lock().unwrap().rate, 115200);
+    assert_eq!(lock(&stats).rate, 115200);
     assert_eq!((s.caps, s.bios), (CAP_LZ4, Some(BIOS)));
 }
 
@@ -256,36 +276,56 @@ async fn memory_regs_and_errors() {
     let (mut s, stats) = attach(SimConfig::default(), Box::new(Hang)).await;
     // Across several DATA frames, an odd length, and len 0.
     let data = program_text(3 * 8192 + 5);
-    s.write_mem(0x8003_0001, &data).await.unwrap();
-    assert_eq!(s.read_mem(0x8003_0001, data.len() as u32).await.unwrap(), data);
-    assert_eq!(s.read_mem(0x8003_0001, 0).await.unwrap(), Vec::<u8>::new());
+    s.write_mem(0x8003_0001, &data).await.expect("WRITE_MEM");
+    assert_eq!(
+        s.read_mem(0x8003_0001, len32(&data))
+            .await
+            .expect("READ_MEM"),
+        data
+    );
+    assert_eq!(
+        s.read_mem(0x8003_0001, 0).await.expect("READ_MEM 0"),
+        Vec::<u8>::new()
+    );
     // No halted context yet.
-    assert!(s.get_regs().await.unwrap().iter().all(|&r| r == 0));
-    let e = s.set_reg(2, 1).await.unwrap_err();
+    assert!(
+        s.get_regs()
+            .await
+            .expect("GET_REGS")
+            .iter()
+            .all(|&r| r == 0)
+    );
+    let e = s
+        .set_reg(2, 1)
+        .await
+        .expect_err("SET_REG needs a halted context");
     assert!(e.to_string().contains("EBADSTATE"), "{e}");
-    let e = s.cont().await.unwrap_err();
+    let e = s.cont().await.expect_err("CONT needs a halted context");
     assert!(e.to_string().contains("EBADSTATE"), "{e}");
     // A corrupted command frame is answered with ECKSUM.
-    let mut bad = psxmon::frame::encode_frame(GET_REGS, &[]);
-    let n = bad.len();
-    bad[n - 1] ^= 0x40;
-    s.transport().write_all(&bad).await.unwrap();
+    let mut bad = psxmon::frame::encode_frame(GET_REGS, &[]).expect("frame");
+    if let Some(last) = bad.last_mut() {
+        *last ^= 0x40;
+    }
+    s.transport().write_all(&bad).await.expect("write");
+    let deadline = deadline_after(Duration::from_secs(1));
     let f = s
-        .wait_frame(&[ERROR], Instant::now() + Duration::from_secs(1))
+        .wait_frame(&[ERROR], deadline)
         .await
-        .unwrap()
-        .unwrap();
+        .expect("wait")
+        .expect("ERROR frame");
     assert_eq!(f.words, vec![E_CKSUM]);
     // STEP is reserved.
-    s.send(STEP, &[]).await.unwrap();
+    s.send(STEP, &[]).await.expect("send");
+    let deadline = deadline_after(Duration::from_secs(1));
     let f = s
-        .wait_frame(&[ERROR], Instant::now() + Duration::from_secs(1))
+        .wait_frame(&[ERROR], deadline)
         .await
-        .unwrap()
-        .unwrap();
+        .expect("wait")
+        .expect("ERROR frame");
     assert_eq!(f.words, vec![E_BADCMD]);
     assert_eq!(
-        stats.lock().unwrap().errors_sent,
+        lock(&stats).errors_sent,
         vec![E_BADSTATE, E_BADSTATE, E_CKSUM, E_BADCMD]
     );
 }
@@ -293,12 +333,10 @@ async fn memory_regs_and_errors() {
 #[tokio::test]
 async fn timeout_when_target_never_stops() {
     let (mut s, _) = attach(SimConfig::default(), Box::new(Hang)).await;
-    s.run(0x8001_0000, 0, 0x801f_fff0).await.unwrap();
+    s.run(0x8001_0000, 0, 0x801f_fff0).await.expect("RUN");
     let t0 = Instant::now();
-    let r = s
-        .run_until_stop(Instant::now() + Duration::from_millis(300), None)
-        .await
-        .unwrap();
+    let deadline = deadline_after(Duration::from_millis(300));
+    let r = s.run_until_stop(deadline, None).await.expect("run");
     assert_eq!(r.stop, None);
     assert_eq!(r.exit_code, None);
     assert!(t0.elapsed() >= Duration::from_millis(300));

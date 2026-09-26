@@ -11,8 +11,10 @@ use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::{self, CAP_LZ4, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session};
 use psxmon::{SerialTransport, bios, exe, lz4};
-use tokio::time::Instant;
 
+/// Largest target exit code passed through as the process exit status;
+/// anything above it (or negative) exits with this value.
+const EXIT_CODE_MAX: u8 = 123;
 /// Exit status when the target did not stop before --timeout.
 const EXIT_TIMEOUT: u8 = 124;
 /// Exit status on a host, link or protocol error.
@@ -21,7 +23,11 @@ const EXIT_ERROR: u8 = 125;
 const EXIT_STOPPED: u8 = 126;
 
 #[derive(Parser)]
-#[command(name = "psxmon", version, about = "Host tool for the PS1 debug monitor")]
+#[command(
+    name = "psxmon",
+    version,
+    about = "Host tool for the PS1 debug monitor"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -43,34 +49,37 @@ struct Link {
     attach_timeout: f64,
 }
 
+#[derive(Args)]
+struct RunArgs {
+    /// Program to run (PS-EXE).
+    file: PathBuf,
+    #[command(flatten)]
+    link: Link,
+    /// Send the program LZ4-compressed when the monitor supports it (default).
+    #[arg(long, overrides_with = "no_lz4")]
+    lz4: bool,
+    /// Send the program uncompressed.
+    #[arg(long, overrides_with = "lz4")]
+    no_lz4: bool,
+    /// Longest LZ4 match copy per sequence.
+    #[arg(long, value_name = "BYTES", default_value_t = lz4::DEFAULT_MAX_MATCH)]
+    max_match: usize,
+    /// Serve PCDRV file I/O from this directory.
+    #[arg(long, value_name = "DIR")]
+    pcdrv: Option<PathBuf>,
+    /// Seconds to let the program run.
+    #[arg(long, value_name = "SECS", default_value_t = 60.0)]
+    timeout: f64,
+    /// Log load details and PCDRV calls to stderr.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Upload a program, run it, stream its console text to stdout, serve
     /// PCDRV, and exit with its exit code.
-    Run {
-        /// Program to run (PS-EXE).
-        file: PathBuf,
-        #[command(flatten)]
-        link: Link,
-        /// Send the program LZ4-compressed when the monitor supports it (default).
-        #[arg(long, overrides_with = "no_lz4")]
-        lz4: bool,
-        /// Send the program uncompressed.
-        #[arg(long, overrides_with = "lz4")]
-        no_lz4: bool,
-        /// Longest LZ4 match copy per sequence.
-        #[arg(long, value_name = "BYTES", default_value_t = lz4::DEFAULT_MAX_MATCH)]
-        max_match: usize,
-        /// Serve PCDRV file I/O from this directory.
-        #[arg(long, value_name = "DIR")]
-        pcdrv: Option<PathBuf>,
-        /// Seconds to let the program run.
-        #[arg(long, value_name = "SECS", default_value_t = 60.0)]
-        timeout: f64,
-        /// Log load details and PCDRV calls to stderr.
-        #[arg(short, long)]
-        verbose: bool,
-    },
+    Run(RunArgs),
     /// Print the monitor's protocol version, capabilities and BIOS.
     Ping {
         #[command(flatten)]
@@ -105,11 +114,21 @@ fn parse_u32(s: &str) -> std::result::Result<u32, String> {
     r.map_err(|e| format!("{s}: {e}"))
 }
 
+fn seconds(secs: f64, what: &str) -> Result<Duration> {
+    Duration::try_from_secs_f64(secs).with_context(|| format!("{what}: bad number of seconds"))
+}
+
 async fn attach(link: &Link) -> Result<Session<SerialTransport>> {
-    let io = SerialTransport::open(&link.port, link.baud).with_context(|| format!("opening {}", link.port))?;
+    let io = SerialTransport::open(&link.port, link.baud)
+        .with_context(|| format!("opening {}", link.port))?;
     let mut s = Session::new(io);
-    if !s.ping(Duration::from_secs_f64(link.attach_timeout), &[]).await? {
-        bail!("no PONG from the monitor on {} at {} baud", link.port, link.baud);
+    let wait = seconds(link.attach_timeout, "--attach-timeout")?;
+    if !s.ping(wait, &[]).await? {
+        bail!(
+            "no PONG from the monitor on {} at {} baud",
+            link.port,
+            link.baud
+        );
     }
     // Anything before the first PONG is boot or line noise, not program text.
     s.take_text();
@@ -151,24 +170,27 @@ async fn ping(link: Link) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run(
-    file: PathBuf,
-    link: Link,
-    lz4: bool,
-    max_match: usize,
-    pcdrv: Option<PathBuf>,
-    timeout: f64,
-    verbose: bool,
-) -> Result<ExitCode> {
+async fn run(args: RunArgs) -> Result<ExitCode> {
+    let RunArgs {
+        file,
+        link,
+        lz4: _,
+        no_lz4,
+        max_match,
+        pcdrv,
+        timeout,
+        verbose,
+    } = args;
+    let lz4 = !no_lz4;
     if max_match < 7 {
         bail!("--max-match must be at least 7");
     }
     let image = exe::load(&file).with_context(|| format!("loading {}", file.display()))?;
     let mut server = match pcdrv {
-        Some(dir) => {
-            Some(PcdrvServer::new(&dir, Quota::default()).with_context(|| format!("PCDRV dir {}", dir.display()))?)
-        }
+        Some(dir) => Some(
+            PcdrvServer::new(&dir, Quota::default())
+                .with_context(|| format!("PCDRV dir {}", dir.display()))?,
+        ),
         None => None,
     };
     let mut s = attach(&link).await?;
@@ -182,8 +204,13 @@ async fn run(
     for seg in &image.segments {
         let st = s.load(seg.addr, &seg.data, &opts).await?;
         if verbose {
-            let how = st.lz4_bytes.map_or("plain".to_string(), |n| format!("lz4 {n} bytes"));
-            eprintln!("psxmon: loaded {} bytes at 0x{:08x} ({how})", st.bytes, seg.addr);
+            let how = st
+                .lz4_bytes
+                .map_or("plain".to_string(), |n| format!("lz4 {n} bytes"));
+            eprintln!(
+                "psxmon: loaded {} bytes at 0x{:08x} ({how})",
+                st.bytes, seg.addr
+            );
         }
     }
     if verbose {
@@ -201,7 +228,7 @@ async fn run(
         let _ = out.write_all(bytes);
         let _ = out.flush();
     })));
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let deadline = psxmon::session::deadline_after(seconds(timeout, "--timeout")?);
     s.run(image.pc, image.gp, image.sp).await?;
     let result = s.run_until_stop(deadline, server.as_mut()).await?;
     if let Some(sv) = server.as_mut() {
@@ -210,7 +237,7 @@ async fn run(
     Ok(match (result.stop, result.exit_code) {
         (_, Some(code)) => {
             eprintln!("psxmon: exit code {code} (0x{code:x})");
-            ExitCode::from(code as u8)
+            ExitCode::from(exit_status(code))
         }
         (Some(stop), None) => {
             debug_assert_ne!(stop.reason, STOP_EXIT);
@@ -233,8 +260,12 @@ async fn run(
 async fn dump(addr: u32, len: u32, output: PathBuf, link: Link) -> Result<ExitCode> {
     let mut s = attach(&link).await?;
     let data = s.read_mem(addr, len).await?;
-    std::fs::write(&output, &data[..len as usize]).with_context(|| format!("writing {}", output.display()))?;
-    eprintln!("psxmon: read {len} bytes at 0x{addr:08x} to {}", output.display());
+    std::fs::write(&output, &data[..len as usize])
+        .with_context(|| format!("writing {}", output.display()))?;
+    eprintln!(
+        "psxmon: read {len} bytes at 0x{addr:08x} to {}",
+        output.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -246,20 +277,20 @@ async fn write(addr: u32, file: PathBuf, link: Link) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The process exit status for a target exit code: the code itself when it
+/// is 0..=123, else 123, so it never reads as one of psxmon's own statuses.
+fn exit_status(code: u32) -> u8 {
+    u8::try_from(code)
+        .ok()
+        .filter(|&c| c <= EXIT_CODE_MAX)
+        .unwrap_or(EXIT_CODE_MAX)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        Cmd::Run {
-            file,
-            link,
-            lz4: _,
-            no_lz4,
-            max_match,
-            pcdrv,
-            timeout,
-            verbose,
-        } => run(file, link, !no_lz4, max_match, pcdrv, timeout, verbose).await,
+        Cmd::Run(args) => run(args).await,
         Cmd::Ping { link } => ping(link).await,
         Cmd::Dump {
             addr,
@@ -273,4 +304,22 @@ async fn main() -> ExitCode {
         eprintln!("psxmon: {e:#}");
         ExitCode::from(EXIT_ERROR)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_status_passes_small_codes_and_caps_the_rest() {
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(42), 42);
+        assert_eq!(exit_status(123), 123);
+        assert_eq!(exit_status(124), EXIT_CODE_MAX);
+        assert_eq!(exit_status(20000), EXIT_CODE_MAX);
+        assert_eq!(exit_status(u32::MAX), EXIT_CODE_MAX);
+        assert_eq!(parse_u32("0x8001_0000"), Ok(0x8001_0000));
+        assert_eq!(parse_u32("4096"), Ok(4096));
+        assert!(parse_u32("0x1_0000_0000").is_err());
+    }
 }

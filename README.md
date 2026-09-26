@@ -21,17 +21,11 @@ binary is a thin command line on top of it.
 `--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
 or `0x` hex.
 
-- `run` loads a PS-EXE, starts it, and copies its console text to stdout. It
-  serves `break 0, 0x101..0x107` PCDRV calls from `--pcdrv DIR`, jailed to
-  that directory. Without `--pcdrv`, every PCDRV call fails with -1. The run
-  ends when the program executes `break 4, 0`, and psxmon then exits with the
-  program's `a0`. The OS keeps only the low 8 bits of that status, so the
-  full value is also printed on stderr. Other exit statuses: 124 on
-  timeout, 125 on a host or link error, and 126 when the target stops
-  without exiting (a fault or another breakpoint).
-- LZ4 is used when the monitor advertises it and it shrinks the program. The
-  compressor caps every match at `--max-match` bytes, because the monitor
-  decodes while it receives and cannot pause the sender inside a frame.
+- `run` loads a PS-EXE, starts it, and copies its console text to stdout.
+  It serves `break 0, 0x101..0x107` PCDRV calls from `--pcdrv DIR`, jailed
+  to that directory. Without `--pcdrv`, every PCDRV call fails with -1. The
+  run ends when the program executes `break 4, 0`, with its exit code in
+  `a0`.
 - `--fast-reload 9` switches SIO1 to 230400 baud after attaching (SET_BAUD
   with its two-PING confirmation). If the new rate does not answer, psxmon
   falls back to the old one. The monitor keeps the new rate, so later
@@ -39,14 +33,18 @@ or `0x` hex.
 - `ping` prints the protocol version, the capability bits, and the BIOS
   checksum with its name from a table of retail BIOS images.
 
+## Exit status
+
+`psxmon run` prints the target's full exit code on stderr. The process exit
+status is that code when it is between 0 and 123, and 123 for any larger
+code. Other statuses: 124 means the target did not stop before `--timeout`,
+125 means a host, link or protocol error, and 126 means the target stopped
+without exiting (a fault or another breakpoint).
+
 ## Build
 
     cargo build --release
     cargo test
-
-The tests run the session against a simulated monitor (`tests/sim`). The
-simulator speaks the byte-stream protocol with 2 MiB of RAM, registers,
-SET_BAUD and a scripted target that makes PCDRV and exit breaks.
 
 ## License
 

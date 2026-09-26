@@ -5,13 +5,25 @@
 
 use crate::proto::{STREAM_MAX_LEN, SYNC};
 
+/// Bytes before the payload: frame start, SYNC, TYPE, LEN.
+const HEADER_BYTES: usize = 7;
+/// Bytes after the payload: CKSUM.
+const TRAILER_BYTES: usize = 4;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FrameError {
+    #[error("frame payload of {0} words exceeds the 65535-word LEN field")]
+    TooLong(usize),
+}
+
 /// The two Fletcher sums over a word stream, with 32-bit wrapping
 /// accumulators and no reduction, as the C sides keep them.
 pub fn fletcher_sums(words: impl IntoIterator<Item = u16>) -> (u32, u32) {
     let mut s1: u32 = 0;
     let mut s2: u32 = 0;
     for w in words {
-        s1 = s1.wrapping_add(w as u32);
+        // Wrapping is the specification: both C sides use uint32_t sums.
+        s1 = s1.wrapping_add(u32::from(w));
         s2 = s2.wrapping_add(s1);
     }
     (s1, s2)
@@ -33,59 +45,77 @@ pub fn fletcher(words: impl IntoIterator<Item = u16>) -> u32 {
     }
 }
 
+/// A byte buffer as 16-bit little-endian words, an odd last byte padded
+/// with 0.
+fn le_words(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    bytes.chunks(2).map(|c| match *c {
+        [lo, hi] => u16::from_le_bytes([lo, hi]),
+        [lo] => u16::from(lo),
+        _ => 0,
+    })
+}
+
 /// Fletcher-32 of a byte buffer read as 16-bit little-endian words, the way
 /// the monitor sums the BIOS region.
 pub fn bios_fletcher(bytes: &[u8]) -> u32 {
-    fletcher_raw(
-        bytes
-            .chunks(2)
-            .map(|c| c[0] as u16 | (*c.get(1).unwrap_or(&0) as u16) << 8),
-    )
+    fletcher_raw(le_words(bytes))
 }
 
-/// One frame on the wire: the 0x00 frame start, SYNC, TYPE, LEN, payload, CKSUM.
-pub fn encode_frame(ty: u16, payload: &[u16]) -> Vec<u8> {
-    assert!(payload.len() <= u16::MAX as usize, "frame payload too long");
-    let len = payload.len() as u16;
+/// The low and high halves of a u32.
+pub fn split_u32(v: u32) -> [u16; 2] {
+    let [a, b, c, d] = v.to_le_bytes();
+    [u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])]
+}
+
+/// One frame on the wire: the 0x00 frame start, SYNC, TYPE, LEN, payload,
+/// CKSUM.
+pub fn encode_frame(ty: u16, payload: &[u16]) -> Result<Vec<u8>, FrameError> {
+    let len = u16::try_from(payload.len()).map_err(|_| FrameError::TooLong(payload.len()))?;
     let ck = fletcher([ty, len].into_iter().chain(payload.iter().copied()));
-    let mut out = Vec::with_capacity(1 + 2 * (payload.len() + 5));
+    let mut out = Vec::with_capacity(
+        payload
+            .len()
+            .saturating_mul(2)
+            .saturating_add(HEADER_BYTES + TRAILER_BYTES),
+    );
     out.push(0);
-    for w in [SYNC, ty, len].into_iter().chain(payload.iter().copied()) {
+    for w in [SYNC, ty, len]
+        .into_iter()
+        .chain(payload.iter().copied())
+        .chain(split_u32(ck))
+    {
         out.extend_from_slice(&w.to_le_bytes());
     }
-    out.extend_from_slice(&(ck as u16).to_le_bytes());
-    out.extend_from_slice(&((ck >> 16) as u16).to_le_bytes());
-    out
+    Ok(out)
 }
 
 /// u32 values to payload words, low half first.
 pub fn u32_words(values: &[u32]) -> Vec<u16> {
-    values.iter().flat_map(|&v| [v as u16, (v >> 16) as u16]).collect()
+    values.iter().flat_map(|&v| split_u32(v)).collect()
 }
 
 /// Bytes to payload words, low byte first, an odd trailing byte padded with 0.
 pub fn bytes_to_words(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .chunks(2)
-        .map(|c| c[0] as u16 | (*c.get(1).unwrap_or(&0) as u16) << 8)
-        .collect()
+    le_words(bytes).collect()
 }
 
 /// `nbytes` bytes unpacked from `words[start..]`, zero past the end.
 pub fn words_to_bytes(words: &[u16], start: usize, nbytes: usize) -> Vec<u8> {
-    (0..nbytes)
-        .map(|i| {
-            let w = words.get(start + (i >> 1)).copied().unwrap_or(0);
-            if i & 1 == 1 { (w >> 8) as u8 } else { w as u8 }
-        })
+    words
+        .iter()
+        .skip(start)
+        .flat_map(|w| w.to_le_bytes())
+        .chain(std::iter::repeat(0))
+        .take(nbytes)
         .collect()
 }
 
 /// The u32 at word `index` (low half first), zero past the end.
 pub fn word_u32(words: &[u16], index: usize) -> u32 {
-    let lo = words.get(index).copied().unwrap_or(0) as u32;
-    let hi = words.get(index + 1).copied().unwrap_or(0) as u32;
-    lo | hi << 16
+    let mut it = words.iter().skip(index).copied();
+    let lo = it.next().unwrap_or(0);
+    let hi = it.next().unwrap_or(0);
+    u32::from(lo) | (u32::from(hi) << 16)
 }
 
 /// A frame as received. `ok` is false when the checksum did not match.
@@ -120,45 +150,44 @@ impl Parser {
         if self.pos > 0 && self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
-        } else if self.pos > 64 * 1024 {
+        } else if self.pos > 65_536 {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
         self.buf.extend_from_slice(bytes);
     }
 
+    fn advance(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.buf.len());
+    }
+
     pub fn next_event(&mut self) -> Option<Event> {
         loop {
-            let buf = &self.buf[self.pos..];
-            if buf.is_empty() {
-                return None;
-            }
-            if buf[0] != 0 {
+            let buf = self.buf.get(self.pos..)?;
+            let (&first, _) = buf.split_first()?;
+            if first != 0 {
                 let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                self.pos += end;
-                return Some(Event::Tty(buf[..end].to_vec()));
+                let text = buf.get(..end)?.to_vec();
+                self.advance(end);
+                return Some(Event::Tty(text));
             }
-            if buf.len() < 7 {
-                return None;
-            }
-            let rd = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
-            let sync = rd(1);
-            let len = rd(5);
+            let &[_, s0, s1, t0, t1, l0, l1] = buf.first_chunk::<HEADER_BYTES>()?;
+            let sync = u16::from_le_bytes([s0, s1]);
+            let ty = u16::from_le_bytes([t0, t1]);
+            let len = u16::from_le_bytes([l0, l1]);
             if sync != SYNC || len > STREAM_MAX_LEN {
                 // A 0 that does not start a frame is noise, as on the monitor side.
-                self.pos += 1;
+                self.advance(1);
                 continue;
             }
-            let total = 7 + 2 * len as usize + 4;
-            if buf.len() < total {
-                return None;
-            }
-            let ty = rd(3);
-            let words: Vec<u16> = (0..len as usize).map(|i| rd(7 + 2 * i)).collect();
-            let off = 7 + 2 * len as usize;
-            let ck = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            // LEN <= STREAM_MAX_LEN, so none of these sizes can overflow.
+            let payload_bytes = usize::from(len).checked_mul(2)?;
+            let body = buf.get(HEADER_BYTES..)?;
+            let (payload, rest) = body.split_at_checked(payload_bytes)?;
+            let ck = u32::from_le_bytes(*rest.first_chunk::<TRAILER_BYTES>()?);
+            let words: Vec<u16> = le_words(payload).collect();
             let ok = ck == fletcher([ty, len].into_iter().chain(words.iter().copied()));
-            self.pos += total;
+            self.advance(payload_bytes.checked_add(HEADER_BYTES + TRAILER_BYTES)?);
             return Some(Event::Frame(Frame { ty, words, ok }));
         }
     }
@@ -168,6 +197,10 @@ impl Parser {
 mod tests {
     use super::*;
     use crate::proto::*;
+
+    fn enc(ty: u16, payload: &[u16]) -> Vec<u8> {
+        encode_frame(ty, payload).expect("test frames fit in a LEN field")
+    }
 
     fn parse_all(bytes: &[u8]) -> Vec<Event> {
         let mut p = Parser::new();
@@ -179,11 +212,13 @@ mod tests {
     fn ping_wire_bytes() {
         // PROTOCOL.md section 2.3 and the SET_BAUD window frames in transport.c.
         assert_eq!(
-            encode_frame(PING, &[]),
-            [0x00, 0xaa, 0x55, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00]
+            enc(PING, &[]),
+            [
+                0x00, 0xaa, 0x55, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00
+            ]
         );
         assert_eq!(
-            encode_frame(PING, &[1]),
+            enc(PING, &[1]),
             [
                 0x00, 0xaa, 0x55, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x06, 0x00
             ]
@@ -193,8 +228,9 @@ mod tests {
     #[test]
     fn golden_fletcher_matches_ts() {
         // Pinned with fletcher() from runner-agent's monitor/protocol.ts under node.
-        let words: Vec<u16> = (0..5000u32)
-            .map(|i| (i.wrapping_mul(0x9e37).wrapping_add(0x1234)) as u16)
+        // (i * 0x9e37 + 0x1234) & 0xffff, as the node script computed it.
+        let words: Vec<u16> = (0..5000u16)
+            .map(|i| i.wrapping_mul(0x9e37).wrapping_add(0x1234))
             .collect();
         assert_eq!(fletcher(words.iter().copied()), 0x6d2fab28);
         assert_eq!(fletcher(std::iter::repeat_n(0xffffu16, 4112)), 0xff7e0000);
@@ -204,9 +240,9 @@ mod tests {
     #[test]
     fn round_trip_with_tty() {
         let mut wire = b"hello ".to_vec();
-        wire.extend(encode_frame(STOPPED, &[1, 2, 3, 4, 5, 6, 7]));
+        wire.extend(enc(STOPPED, &[1, 2, 3, 4, 5, 6, 7]));
         wire.extend(b"world");
-        wire.extend(encode_frame(ACK, &[]));
+        wire.extend(enc(ACK, &[]));
         let ev = parse_all(&wire);
         assert_eq!(
             ev,
@@ -230,7 +266,7 @@ mod tests {
     #[test]
     fn byte_at_a_time_and_zero_runs() {
         let mut wire = vec![0, 0, 0];
-        wire.extend(encode_frame(PONG, &[2, 1, 0x1234, 0x5678]));
+        wire.extend(enc(PONG, &[2, 1, 0x1234, 0x5678]));
         let mut p = Parser::new();
         let mut got = vec![];
         for b in wire {
@@ -251,16 +287,17 @@ mod tests {
 
     #[test]
     fn corrupted_frame_is_flagged() {
-        let mut wire = encode_frame(DATA, &[4, 0, 0x4241, 0x4443]);
+        let mut wire = enc(DATA, &[4, 0, 0x4241, 0x4443]);
         wire[9] ^= 0x01; // a payload byte
         match &parse_all(&wire)[..] {
             [Event::Frame(f)] => assert!(!f.ok),
             other => panic!("unexpected {other:?}"),
         }
         // A zero checksum is never valid on a stream link.
-        let mut wire = encode_frame(ACK, &[]);
-        let n = wire.len();
-        wire[n - 4..].fill(0);
+        let mut wire = enc(ACK, &[]);
+        if let Some(ck) = wire.last_chunk_mut::<4>() {
+            *ck = [0; 4];
+        }
         match &parse_all(&wire)[..] {
             [Event::Frame(f)] => assert!(!f.ok),
             other => panic!("unexpected {other:?}"),
@@ -276,7 +313,7 @@ mod tests {
         );
         // LEN above the stream limit is noise.
         let mut wire = vec![0, 0xaa, 0x55, 0x41, 0x00];
-        wire.extend((STREAM_MAX_LEN + 1).to_le_bytes());
+        wire.extend(STREAM_MAX_LEN.checked_add(1).expect("4113").to_le_bytes());
         wire.extend(b"xy");
         let ev = parse_all(&wire);
         assert!(ev.iter().all(|e| matches!(e, Event::Tty(_))));
@@ -289,7 +326,8 @@ mod tests {
         let mut payload = u32_words(&[8192]);
         payload.extend(bytes_to_words(&[0xff; 8192]));
         assert_eq!(payload.len(), 4098);
-        let words: Vec<u16> = [DATA, payload.len() as u16]
+        let len = u16::try_from(payload.len()).expect("4098 words");
+        let words: Vec<u16> = [DATA, len]
             .into_iter()
             .chain(payload.iter().copied())
             .collect();
@@ -297,13 +335,13 @@ mod tests {
         let wide: u64 = {
             let (mut a, mut b) = (0u64, 0u64);
             for &w in &words {
-                a += w as u64;
-                b += a;
+                a = a.checked_add(u64::from(w)).expect("no u64 overflow");
+                b = b.checked_add(a).expect("no u64 overflow");
             }
             b
         };
-        assert!(wide > u32::MAX as u64 && wide as u32 == s2);
-        let wire = encode_frame(DATA, &payload);
+        assert!(wide > u64::from(u32::MAX) && wide & 0xffff_ffff == u64::from(s2));
+        let wire = enc(DATA, &payload);
         match &parse_all(&wire)[..] {
             [Event::Frame(f)] => {
                 assert!(f.ok);

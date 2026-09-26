@@ -23,3 +23,32 @@ tokio-serial = "5.4"
 [dev-dependencies]
 lz4_flex = "0.11"
 tempfile = "3"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+mod_module_files = "deny"
+self_named_module_files = "allow"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+pub_without_shorthand = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+pub_use = "allow"
+pub_with_shorthand = "allow"
+arbitrary_source_item_ordering = "allow"
+implicit_return = "allow"
+single_call_fn = "allow"
+question_mark_used = "allow"
+print_stdout = "allow"
+use_debug = "allow"
+todo = "allow"
+shadow_same = "allow"
+shadow_reuse = "allow"
+shadow_unrelated = "allow"
+allow_attributes = "allow"
+missing_errors_doc = "allow"

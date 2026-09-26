@@ -117,7 +117,12 @@ pub const SIO1_RATE_CLOCK: u32 = 2_073_600;
 
 /// Nominal line rate of a SIO1 reload value (18 -> 115200, 9 -> 230400).
 pub fn sio1_rate(reload: u16) -> u32 {
-    (SIO1_RATE_CLOCK as f64 / reload.max(1) as f64).round() as u32
+    let reload = u32::from(reload.max(1));
+    // Rounded to nearest; the clock plus half a reload cannot overflow u32.
+    SIO1_RATE_CLOCK
+        .saturating_add(reload / 2)
+        .checked_div(reload)
+        .unwrap_or(SIO1_RATE_CLOCK)
 }
 
 /// A software `break code1, code2`, decoded from its instruction word.
@@ -158,11 +163,11 @@ mod tests {
 
     #[test]
     fn break_codes() {
-        let exit = BreakCode::decode(0x0004000d).unwrap();
+        let exit = BreakCode::decode(0x0004000d).expect("a break");
         assert!(exit.is_exit());
         let entry = BreakCode { code1: 4, code2: 1 }.encode();
         assert_eq!(entry, 0x0004004d);
-        let pc = BreakCode::decode((0x106 << 6) | 0x0d).unwrap();
+        let pc = BreakCode::decode((0x106 << 6) | 0x0d).expect("a break");
         assert_eq!(pc.pcdrv_op(), Some(PC_WRITE));
         assert_eq!(BreakCode::decode(0x0000_0000), None);
         assert_eq!(sio1_rate(18), 115200);

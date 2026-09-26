@@ -36,7 +36,8 @@ impl SerialTransport {
         // has no modem lines, so a failure here is not fatal.
         let _ = port.write_request_to_send(true);
         let _ = port.write_data_terminal_ready(true);
-        port.clear(tokio_serial::ClearBuffer::All).map_err(io::Error::from)?;
+        port.clear(tokio_serial::ClearBuffer::All)
+            .map_err(io::Error::from)?;
         Ok(SerialTransport { port, baud })
     }
 }
@@ -54,13 +55,21 @@ impl Transport for SerialTransport {
 }
 
 impl AsyncRead for SerialTransport {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.port).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for SerialTransport {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.port).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -107,13 +116,21 @@ impl Transport for MemTransport {
 }
 
 impl AsyncRead for MemTransport {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for MemTransport {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
