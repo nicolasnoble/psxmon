@@ -1,6 +1,7 @@
 //! Program images: what gets written where, and where execution starts.
-//! PS-EXE, ELF and CPE, told apart by their magic.
+//! PS-EXE, ELF, CPE and PSF/MiniPSF, told apart by their magic.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Size of the PS-EXE header; the text follows it.
@@ -61,7 +62,7 @@ impl Image {
 pub enum ExeError {
     #[error("file too small to be a PS-EXE: need at least a 0x800-byte header")]
     TooSmall,
-    #[error("unrecognised program format (want PS-EXE, ELF or CPE)")]
+    #[error("unrecognised program format (want PS-EXE, ELF, CPE or PSF)")]
     Unknown,
     #[error("truncated {0}")]
     Truncated(&'static str),
@@ -69,6 +70,8 @@ pub enum ExeError {
     Elf(String),
     #[error("CPE: {0}")]
     Cpe(String),
+    #[error("PSF: {0}")]
+    Psf(String),
     #[error("{0} does not fit in the address space")]
     TooLarge(&'static str),
     #[error(transparent)]
@@ -369,13 +372,244 @@ pub fn parse(file: &[u8]) -> Result<Image, ExeError> {
         parse_cpe(file)
     } else if file.starts_with(b"PS-X EXE") {
         parse_ps_exe(file)
+    } else if file.starts_with(PSF_MAGIC) {
+        Err(ExeError::Psf(
+            "a PSF is loaded from a path, to find its _lib files (exe::load)".into(),
+        ))
     } else {
         Err(ExeError::Unknown)
     }
 }
 
+/// Load a program file. A PSF pulls in its `_lib` files, found relative to
+/// the file that names them; PSF warnings (skipped libraries) go to stderr.
 pub fn load(path: &Path) -> Result<Image, ExeError> {
-    parse(&std::fs::read(path)?)
+    let file = std::fs::read(path)?;
+    if file.starts_with(PSF_MAGIC) {
+        let psf = load_psf(path)?;
+        for w in &psf.warnings {
+            eprintln!("psxmon: {w}");
+        }
+        return Ok(psf.image);
+    }
+    parse(&file)
+}
+
+/// `PSF` then version 0x01, the PlayStation one.
+pub const PSF_MAGIC: &[u8; 4] = b"PSF\x01";
+/// PCSX-Redux's `loadPSF` gives up at this `_lib` nesting depth.
+pub const PSF_MAX_DEPTH: u32 = 10;
+
+/// Video region a PSF asks for, from its `refresh` tag or the PS-EXE's
+/// region marker. Informational: psxmon cannot change the console's region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    Ntsc,
+    Pal,
+}
+
+/// A loaded PSF: the program image, the region hint, and the `_lib`
+/// entries that were skipped (missing, not a PSF, or nested too deep).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Psf {
+    pub image: Image,
+    pub region: Option<Region>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct PsfState {
+    segments: Vec<Segment>,
+    pc: Option<u32>,
+    gp: Option<u32>,
+    sp: Option<u32>,
+    region: Option<Region>,
+    /// Whether any PS-EXE has been loaded yet, across the whole chain.
+    seen_exe: bool,
+    warnings: Vec<String>,
+}
+
+/// The PSF tag area, the way PCSX-Redux reads it: after `[TAG]`, split on
+/// `\n` and `\r`, each line cut at its first `=`, no trimming, keys
+/// case-sensitive, the last of a repeated key wins. Lines without `=` are
+/// ignored. No `[TAG]` means no tags.
+pub fn psf_tags(tag_area: &[u8]) -> HashMap<String, String> {
+    let mut pairs = HashMap::new();
+    let Some(text) = tag_area.strip_prefix(b"[TAG]") else {
+        return pairs;
+    };
+    for line in text.split(|&b| b == b'\n' || b == b'\r') {
+        if let Some(eq) = line.iter().position(|&b| b == b'=') {
+            let (key, value) = line.split_at(eq);
+            pairs.insert(
+                String::from_utf8_lossy(key).into_owned(),
+                String::from_utf8_lossy(value.get(1..).unwrap_or_default()).into_owned(),
+            );
+        }
+    }
+    pairs
+}
+
+/// A PSF (version 0x01) or MiniPSF with its `_lib` chain, loaded with the
+/// semantics of PCSX-Redux's `loadPSF`/`loadPSEXE` (`binloader.cc`):
+///
+/// - Layout: `PSF\x01`, reserved size R, program size N, CRC (not
+///   checked), R reserved bytes (skipped), N bytes of zlib-compressed
+///   PS-EXE, then optionally `[TAG]` and the tags (see [`psf_tags`]).
+/// - Order: the `_lib` file (recursively), then this file's PS-EXE, then
+///   `_lib2`, `_lib3`, ... for as long as the numbering is unbroken. Library
+///   paths are relative to the directory of the file naming them. Later
+///   writes win where they overlap.
+/// - pc and sp come from the FIRST PS-EXE loaded (for a MiniPSF on a lib,
+///   the lib's): pc is `pc0`, sp is `s_addr` (not `s_addr + s_size`) and
+///   only when non-zero, else [`DEFAULT_STACK`]. Later PS-EXEs are overlays.
+///   Redux does not set gp for a PSF; psxmon uses the first PS-EXE's `gp0`.
+/// - Each PS-EXE writes exactly `t_size` bytes (fewer if the data is
+///   shorter) at `t_addr`; no padding.
+/// - Region: the first `refresh` tag met in load order (50 PAL, 60 NTSC)
+///   is set before any PS-EXE loads, then every PS-EXE's byte at 0x71
+///   (`A`/`J` NTSC, `E` PAL) overrides it as it loads.
+/// - A `_lib` that does not open, is not a PSF, or is 10 levels deep is
+///   skipped, as Redux does; psxmon records a warning. A decompressed
+///   program that is not a PS-EXE loads nothing but still counts as the
+///   first exe. A corrupt zlib stream is an error.
+pub fn load_psf(path: &Path) -> Result<Psf, ExeError> {
+    let file = std::fs::read(path)?;
+    if !file.starts_with(PSF_MAGIC) {
+        return Err(ExeError::Psf(
+            "not a PSF (want \"PSF\" version 0x01)".into(),
+        ));
+    }
+    let mut st = PsfState::default();
+    load_psf_file(path, &file, &mut st, false, 0)?;
+    let pc = st
+        .pc
+        .ok_or_else(|| ExeError::Psf("no PS-EXE with an entry point in the chain".into()))?;
+    Ok(Psf {
+        image: Image {
+            segments: st.segments,
+            pc,
+            gp: st.gp.unwrap_or(0),
+            sp: st.sp.unwrap_or(DEFAULT_STACK),
+        },
+        region: st.region,
+        warnings: st.warnings,
+    })
+}
+
+/// A `_lib` entry: open and load it, or record why it was skipped.
+fn load_psf_lib(
+    parent: &Path,
+    tag: &str,
+    name: &str,
+    st: &mut PsfState,
+    seen_refresh: bool,
+    depth: u32,
+) -> Result<(), ExeError> {
+    let dir = parent.parent().unwrap_or_else(|| Path::new(""));
+    let path = dir.join(name);
+    let file = match std::fs::read(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            st.warnings.push(format!(
+                "{}: {tag} {}: {e}; skipped",
+                parent.display(),
+                path.display()
+            ));
+            return Ok(());
+        }
+    };
+    if !load_psf_file(&path, &file, st, seen_refresh, depth)? {
+        st.warnings.push(format!(
+            "{}: {tag} {}: not a PSF or nested {PSF_MAX_DEPTH} deep; skipped",
+            parent.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Redux's `loadPSF`: false (nothing loaded) on a bad magic or too deep.
+fn load_psf_file(
+    path: &Path,
+    file: &[u8],
+    st: &mut PsfState,
+    mut seen_refresh: bool,
+    depth: u32,
+) -> Result<bool, ExeError> {
+    if depth >= PSF_MAX_DEPTH || !file.starts_with(PSF_MAGIC) {
+        return Ok(false);
+    }
+    let reserved = to_usize(rd32(file, 4, "PSF header")?, "PSF reserved size")?;
+    let program = to_usize(rd32(file, 8, "PSF header")?, "PSF program size")?;
+    let start = 16usize
+        .checked_add(reserved)
+        .ok_or(ExeError::TooLarge("PSF reserved area"))?;
+    let end = start
+        .checked_add(program)
+        .ok_or(ExeError::TooLarge("PSF program"))?;
+    let compressed = file
+        .get(start..end)
+        .ok_or(ExeError::Truncated("PSF program"))?;
+    let tags = psf_tags(file.get(end..).unwrap_or_default());
+
+    if !seen_refresh && let Some(refresh) = tags.get("refresh") {
+        match refresh.as_str() {
+            "50" => st.region = Some(Region::Pal),
+            "60" => st.region = Some(Region::Ntsc),
+            _ => {}
+        }
+        seen_refresh = true;
+    }
+    let next = depth.saturating_add(1);
+    if let Some(lib) = tags.get("_lib") {
+        load_psf_lib(path, "_lib", lib, st, seen_refresh, next)?;
+    }
+    let exe = miniz_oxide::inflate::decompress_to_vec_zlib(compressed).map_err(|e| {
+        ExeError::Psf(format!(
+            "{}: bad zlib stream: {:?}",
+            path.display(),
+            e.status
+        ))
+    })?;
+    load_psf_exe(&exe, st);
+    st.seen_exe = true;
+    for n in 2u32.. {
+        let key = format!("_lib{n}");
+        let Some(lib) = tags.get(&key) else {
+            break;
+        };
+        load_psf_lib(path, &key, lib, st, seen_refresh, next)?;
+    }
+    Ok(true)
+}
+
+/// Redux's `loadPSEXE` with `overlay = seen_exe`.
+fn load_psf_exe(exe: &[u8], st: &mut PsfState) {
+    if !exe.starts_with(b"PS-X EXE") {
+        return;
+    }
+    let field = |off: usize| rd32(exe, off, "PS-EXE header").unwrap_or(0);
+    if !st.seen_exe {
+        st.pc = Some(field(0x10));
+        st.gp = Some(field(0x14));
+        let sp = field(0x30);
+        if sp != 0 {
+            st.sp = Some(sp);
+        }
+    }
+    let size = usize::try_from(field(0x1c)).unwrap_or(usize::MAX);
+    let text = exe.get(PS_EXE_HEADER_SIZE..).unwrap_or_default();
+    let data = text.get(..size.min(text.len())).unwrap_or_default();
+    st.segments.push(Segment {
+        addr: field(0x18),
+        data: data.to_vec(),
+    });
+    match exe.get(0x71) {
+        Some(b'A' | b'J') => st.region = Some(Region::Ntsc),
+        Some(b'E') => st.region = Some(Region::Pal),
+        _ => {}
+    }
 }
 
 /// A minimal PS-EXE around `text`, for tests and tools.
@@ -647,5 +881,212 @@ mod tests {
         // Unknown chunk, and no entry point.
         assert!(matches!(parse(b"CPE\x01\x09"), Err(ExeError::Cpe(_))));
         assert!(matches!(parse(b"CPE\x01\x00"), Err(ExeError::Cpe(_))));
+    }
+
+    /// A PSF around `exe`: `reserved` bytes of reserved area, then the
+    /// zlib-compressed program, then `tags` (with `[TAG]` if non-empty).
+    fn build_psf(exe: &[u8], reserved: usize, tags: &str) -> Vec<u8> {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(exe, 6);
+        let mut f = PSF_MAGIC.to_vec();
+        f.extend_from_slice(&u32::try_from(reserved).expect("r").to_le_bytes());
+        f.extend_from_slice(&u32::try_from(z.len()).expect("n").to_le_bytes());
+        f.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        f.resize(f.len().saturating_add(reserved), 0xaa);
+        f.extend_from_slice(&z);
+        if !tags.is_empty() {
+            f.extend_from_slice(b"[TAG]");
+            f.extend_from_slice(tags.as_bytes());
+        }
+        f
+    }
+
+    /// A PS-EXE with `text` at `t_addr`, `t_size` exactly `text.len()`,
+    /// `s_addr`/`s_size` as given, and `region` at 0x71.
+    fn psf_exe(text: &[u8], t_addr: u32, pc: u32, s_addr: u32, s_size: u32, region: u8) -> Vec<u8> {
+        let mut e = build_ps_exe(text, t_addr, pc, 0x8003_0000, s_addr).expect("build");
+        e.truncate(PS_EXE_HEADER_SIZE.saturating_add(text.len()));
+        let mut put = |off: usize, v: &[u8]| {
+            e.get_mut(off..off.saturating_add(v.len()))
+                .expect("hdr")
+                .copy_from_slice(v);
+        };
+        put(0x1c, &u32::try_from(text.len()).expect("len").to_le_bytes());
+        put(0x34, &s_size.to_le_bytes());
+        put(0x71, &[region]);
+        e
+    }
+
+    fn write(dir: &Path, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        std::fs::write(&p, data).expect("write");
+        p
+    }
+
+    #[test]
+    fn psf_single_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let exe = psf_exe(
+            &[1, 2, 3, 4, 5],
+            0x8001_0000,
+            0x8001_0004,
+            0x801f_0000,
+            0x100,
+            b'E',
+        );
+        let p = write(dir.path(), "a.psf", &build_psf(&exe, 7, "title=x\n"));
+        let psf = load_psf(&p).expect("psf");
+        // sp is s_addr alone; t_size bytes exactly, no padding.
+        assert_eq!(
+            (psf.image.pc, psf.image.gp, psf.image.sp),
+            (0x8001_0004, 0x8003_0000, 0x801f_0000)
+        );
+        assert_eq!(
+            psf.image.segments,
+            vec![Segment {
+                addr: 0x8001_0000,
+                data: vec![1, 2, 3, 4, 5]
+            }]
+        );
+        assert_eq!(psf.region, Some(Region::Pal));
+        assert!(psf.warnings.is_empty());
+        assert_eq!(load(&p).expect("load"), psf.image);
+        assert!(matches!(
+            parse(&build_psf(&exe, 0, "")),
+            Err(ExeError::Psf(_))
+        ));
+
+        // s_addr 0: default stack, and no tags at all is fine.
+        let exe = psf_exe(&[1], 0x8001_0000, 0x8001_0000, 0, 0x100, 0);
+        let p = write(dir.path(), "b.psf", &build_psf(&exe, 0, ""));
+        let psf = load_psf(&p).expect("psf");
+        assert_eq!(psf.image.sp, DEFAULT_STACK);
+        assert_eq!(psf.region, None);
+    }
+
+    #[test]
+    fn minipsf_takes_pc_and_sp_from_its_lib_and_overlays_it() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let lib = psf_exe(&[0x11; 16], 0x8001_0000, 0x8001_0008, 0x801f_f000, 0, b'J');
+        write(
+            dir.path(),
+            "libs/drv.psflib",
+            &build_psf(&lib, 0, "_lib2=../extra.psflib\n"),
+        );
+        let extra = psf_exe(&[0x33; 2], 0x8004_0000, 0x8004_0000, 0x8010_0000, 0, 0);
+        write(dir.path(), "extra.psflib", &build_psf(&extra, 0, ""));
+        // The minipsf's header pc/sp are placeholders and must lose.
+        let mini = psf_exe(&[0x22; 4], 0x8001_0004, 0x8001_0000, 0x8000_1000, 0, b'E');
+        let p = write(
+            dir.path(),
+            "song.minipsf",
+            &build_psf(&mini, 0, "_lib=libs/drv.psflib\r\nrefresh=60\n"),
+        );
+        let psf = load_psf(&p).expect("psf");
+        assert_eq!((psf.image.pc, psf.image.sp), (0x8001_0008, 0x801f_f000));
+        let order: Vec<(u32, usize)> = psf
+            .image
+            .segments
+            .iter()
+            .map(|s| (s.addr, s.data.len()))
+            .collect();
+        // lib, then its _lib2 (resolved from libs/), then the minipsf.
+        assert_eq!(
+            order,
+            vec![(0x8001_0000, 16), (0x8004_0000, 2), (0x8001_0004, 4)]
+        );
+        // refresh=60 first, then each exe's region byte: J, (none), E.
+        assert_eq!(psf.region, Some(Region::Pal));
+        assert!(psf.warnings.is_empty(), "{:?}", psf.warnings);
+    }
+
+    #[test]
+    fn numbered_libs_load_after_in_order_until_a_gap() {
+        let dir = tempfile::tempdir().expect("tmp");
+        for (n, addr) in [(2u32, 0x8002_0000u32), (3, 0x8003_0000), (5, 0x8005_0000)] {
+            let e = psf_exe(&[0x55], addr, addr, addr, 0, 0);
+            write(dir.path(), &format!("l{n}.psflib"), &build_psf(&e, 0, ""));
+        }
+        let top = psf_exe(&[0x66], 0x8001_0000, 0x8001_0000, 0, 0, 0);
+        let p = write(
+            dir.path(),
+            "t.minipsf",
+            &build_psf(
+                &top,
+                0,
+                "_lib3=l3.psflib\n_lib2=l2.psflib\n_lib5=l5.psflib\n",
+            ),
+        );
+        let psf = load_psf(&p).expect("psf");
+        let addrs: Vec<u32> = psf.image.segments.iter().map(|s| s.addr).collect();
+        assert_eq!(addrs, vec![0x8001_0000, 0x8002_0000, 0x8003_0000]);
+        assert_eq!((psf.image.pc, psf.image.sp), (0x8001_0000, DEFAULT_STACK));
+    }
+
+    #[test]
+    fn missing_or_bad_lib_is_skipped_and_the_minipsf_exe_is_first() {
+        let dir = tempfile::tempdir().expect("tmp");
+        write(dir.path(), "junk.psflib", b"not a psf");
+        let mini = psf_exe(&[1], 0x8001_0000, 0x8001_0000, 0x801f_0000, 0, 0);
+        let p = write(
+            dir.path(),
+            "m.minipsf",
+            &build_psf(&mini, 0, "_lib=gone.psflib\n_lib2=junk.psflib\n"),
+        );
+        let psf = load_psf(&p).expect("psf");
+        assert_eq!((psf.image.pc, psf.image.sp), (0x8001_0000, 0x801f_0000));
+        assert_eq!(psf.warnings.len(), 2, "{:?}", psf.warnings);
+    }
+
+    #[test]
+    fn lib_chain_stops_at_depth_ten_and_top_refresh_wins() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // A lib that names itself: Redux loads it until depth 10.
+        let e = psf_exe(&[7], 0x8001_0000, 0x8001_0000, 0, 0, 0);
+        write(
+            dir.path(),
+            "self.psflib",
+            &build_psf(&e, 0, "_lib=self.psflib\nrefresh=60\n"),
+        );
+        let top = psf_exe(&[8], 0x8002_0000, 0x8002_0000, 0, 0, 0);
+        let p = write(
+            dir.path(),
+            "top.minipsf",
+            &build_psf(&top, 0, "refresh=50\n_lib=self.psflib\n"),
+        );
+        let psf = load_psf(&p).expect("psf");
+        // depth 0 is top.minipsf, depths 1..=9 the lib: 9 lib loads + top.
+        assert_eq!(psf.image.segments.len(), 10);
+        assert_eq!(psf.image.pc, 0x8001_0000);
+        assert_eq!(psf.region, Some(Region::Pal));
+        assert_eq!(psf.warnings.len(), 1);
+    }
+
+    #[test]
+    fn psf_tag_parsing_and_errors() {
+        let tags = psf_tags(b"[TAG]a=1\r\nb= x = y \n\nnoequals\na=2\n_LIB=z");
+        assert_eq!(tags.get("a").map(String::as_str), Some("2"));
+        assert_eq!(tags.get("b").map(String::as_str), Some(" x = y "));
+        assert_eq!(tags.get("_LIB").map(String::as_str), Some("z"));
+        assert!(!tags.contains_key("_lib"));
+        assert_eq!(tags.len(), 3);
+        assert!(psf_tags(b"[tag]a=1").is_empty());
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut bad = build_psf(&[0; 8], 0, "");
+        bad.truncate(bad.len() - 1);
+        let p = write(dir.path(), "trunc.psf", &bad);
+        assert!(matches!(load_psf(&p), Err(ExeError::Truncated(_))));
+        let mut bad = build_psf(&psf_exe(&[1], 0x8001_0000, 0x8001_0000, 0, 0, 0), 0, "");
+        if let Some(b) = bad.get_mut(20) {
+            *b ^= 0xff;
+        }
+        let p = write(dir.path(), "corrupt.psf", &bad);
+        assert!(load_psf(&p).is_err());
+        // Not a PS-EXE inside: nothing loads, so there is no entry point.
+        let p = write(dir.path(), "empty.psf", &build_psf(b"hello", 0, ""));
+        assert!(matches!(load_psf(&p), Err(ExeError::Psf(_))));
     }
 }

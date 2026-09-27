@@ -2,6 +2,7 @@
 //! version 2): framing on a byte link, a session that loads and runs
 //! programs and serves their PCDRV calls, and the pieces it is built from.
 
+pub mod atcons;
 pub mod bios;
 pub mod exe;
 pub mod frame;
@@ -15,5 +16,6 @@ pub mod proto;
 pub mod session;
 pub mod transport;
 
+pub use atcons::AtconsTransport;
 pub use session::{LoadOptions, RunResult, Session, SessionError, Stop};
 pub use transport::{MemTransport, SerialTransport, Transport};

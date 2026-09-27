@@ -6,7 +6,7 @@ Host tool for the PS1 debug monitor. The monitor is part of
 of the PCSX-Redux emulator. The release images are built from the nugget
 submodule here. psxmon speaks wire protocol version 2,
 described in `monitor/PROTOCOL.md`. It talks to the monitor through a
-serial port. With it you can upload and run a program, stream the
+serial port, or through the DTL-H2700's ISA card (ATCONS). With it you can upload and run a program, stream the
 program's console text, serve its PCDRV file I/O from a host directory,
 and read or write target memory.
 
@@ -23,11 +23,15 @@ binary is a thin command line on top of it.
     psxmon ping --port DEV [--baud 115200]
     psxmon dump <addr> <len> -o FILE --port DEV
     psxmon write <addr> <file> --port DEV
+    psxmon h2700-reset [--mode 7] [--port atcons[:BASE]] [--no-connect]
+                       [--console SECS]
     psxmon patch-h2700 <stock> <monitor> -o FILE
     psxmon mkdisc <exe> -o FILE.bin [--license FILE] [--no-pad]
 
 `--port DEV` is the serial port the monitor is on (see below), or
-`PSXMON_PORT` when `--port` is left out. Addresses and lengths take decimal
+`PSXMON_PORT` when `--port` is left out. `--port atcons` (or `atcons:BASE`,
+default base 0x1340) uses the DTL-H2700's ISA card instead; see below.
+Addresses and lengths take decimal
 or `0x` hex.
 
 - `run` loads a program, starts it, and copies its console text to stdout.
@@ -35,11 +39,17 @@ or `0x` hex.
   to that directory. Without `--pcdrv`, every PCDRV call fails with -1. The
   run ends when the program executes `break 4, 0`, with its exit code in
   `a0`.
-- Programs can be PS-EXE, ELF or CPE, told apart by their magic. An ELF
+- Programs can be PS-EXE, ELF, CPE or PSF, told apart by their magic. An ELF
   loads its PT_LOAD segments at their physical addresses, minus the header
   sections, and starts at `e_entry` with gp from `_gp`. A CPE loads its load
   chunks and starts at register 0x90. ELF and CPE get sp 0x807FFF00, the top
   of 8 MB, which a 2 MB console mirrors to the top of its RAM.
+- PSF (version 0x01) and MiniPSF load as PCSX-Redux loads them: `_lib`
+  first, then the file's own PS-EXE, then `_lib2`, `_lib3`, ..., with
+  library paths relative to the file naming them. pc and sp (`s_addr`,
+  0x801FFFF0 if zero) come from the first PS-EXE loaded, so a MiniPSF
+  starts at its library's entry point. Missing libraries are skipped with a
+  warning.
 - LZ4 is used when the monitor advertises it and it shrinks the program. The
   compressor caps every match at `--max-match` bytes, because the monitor
   decodes while it receives and cannot pause the sender inside a frame.
@@ -89,6 +99,28 @@ and pass the pty:
 
     socat PTY,link=/tmp/psx,raw,echo=0 TCP:127.0.0.1:6699 &
     psxmon run prog.ps-exe --port /tmp/psx
+
+## DTL-H2700 (ATCONS)
+
+On the DTL-H2700 the monitor runs from the code cave of the cart's flash
+(`patch-h2700`) and talks over the ISA card's two channels: frames on the
+16-bit word channel, the OpenBIOS console on the byte channel. psxmon drives
+the card with port I/O, so this needs x86 Linux and root (or
+`CAP_SYS_RAWIO` on the binary: `setcap cap_sys_rawio+ep psxmon`). On other
+systems `--port atcons` fails with an error.
+
+    sudo psxmon h2700-reset
+    sudo psxmon run prog.cpe --port atcons --pcdrv ./pc
+
+- `h2700-reset` resets the PS1 into `--mode` (7, the default, boots the
+  monitor; other modes the stock BIOS), then opens the card's host side the
+  way the SDK tools connect. In mode 7 it copies the boot's console text to
+  stdout until the monitor's HELLO, and prints the HELLO.
+- Attaching reads a HELLO still waiting in the word channel, then PINGs.
+- There is no line rate (`--baud` is ignored, `--fast-reload` is an error)
+  and no STOP: a running program stops only on its own.
+- psxmon polls the card from a thread and spins while data moves, so a
+  transfer keeps one CPU busy.
 
 ## Debugging with gdb
 

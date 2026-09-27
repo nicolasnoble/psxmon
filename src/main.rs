@@ -10,9 +10,12 @@ use clap::{Args, Parser, Subcommand};
 use gdbstub::stub::DisconnectReason;
 use psxmon::gdb::MonTarget;
 use psxmon::pcdrv::{PcdrvServer, Quota};
-use psxmon::proto::{self, CAP_LZ4, CAP_SLOT, CAP_STOP, STOP_EXIT};
-use psxmon::session::{LoadOptions, Session};
-use psxmon::{SerialTransport, bios, exe, h2700, iso, lz4};
+use psxmon::proto::{self, CAP_LZ4, CAP_SLOT, CAP_STOP, HELLO, STOP_EXIT};
+use psxmon::session::{LoadOptions, Session, deadline_after};
+use psxmon::{AtconsTransport, SerialTransport, Transport, atcons, bios, exe, h2700, iso, lz4};
+
+/// A session on whichever link --port names.
+type MonSession = Session<Box<dyn Transport>>;
 
 /// Largest target exit code passed through as the process exit status;
 /// anything above it (or negative) exits with this value.
@@ -37,10 +40,11 @@ struct Cli {
 
 #[derive(Args)]
 struct Link {
-    /// Serial device the monitor is on.
+    /// Serial device the monitor is on, or `atcons[:BASE]` for the
+    /// DTL-H2700's ISA card (base 0x1340 by default; x86 Linux, root).
     #[arg(long, env = "PSXMON_PORT")]
     port: String,
-    /// Line rate the monitor listens at after boot.
+    /// Line rate the monitor listens at after boot (not used on ATCONS).
     #[arg(long, default_value_t = 115200)]
     baud: u32,
     /// SIO1 reload to switch to after attaching (9 = 230400, 5 = 414720).
@@ -53,7 +57,7 @@ struct Link {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Program to run (PS-EXE, ELF or CPE).
+    /// Program to run (PS-EXE, ELF, CPE or PSF).
     file: PathBuf,
     #[command(flatten)]
     link: Link,
@@ -79,7 +83,7 @@ struct RunArgs {
 
 #[derive(Args)]
 struct GdbArgs {
-    /// Program to load (PS-EXE, ELF or CPE); gdb finds it halted on its
+    /// Program to load (PS-EXE, ELF, CPE or PSF); gdb finds it halted on its
     /// first instruction. Without it, gdb attaches to whatever program the
     /// monitor has halted.
     file: Option<PathBuf>,
@@ -144,6 +148,25 @@ enum Cmd {
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
     },
+    /// Reset the DTL-H2700's PS1 through its ISA card (x86 Linux, root).
+    /// Mode 7 boots the monitor in the flash cave, other modes the stock
+    /// BIOS. Then connect the card's host side and, in mode 7, copy the
+    /// boot's console text to stdout until the monitor's HELLO.
+    H2700Reset {
+        /// Reset mode.
+        #[arg(long, default_value_t = 7)]
+        mode: u8,
+        /// The card: atcons or atcons:BASE.
+        #[arg(long, default_value = "atcons")]
+        port: String,
+        /// Reset only; leave the card's host side closed.
+        #[arg(long)]
+        no_connect: bool,
+        /// Seconds to wait for the monitor's HELLO after a mode 7 reset (0:
+        /// do not wait).
+        #[arg(long, value_name = "SECS", default_value_t = 5.0)]
+        console: f64,
+    },
     /// Build a bootable disc image from EXE, a PS-EXE, as PSX.EXE: the same
     /// `.bin` as PCSX-Redux's exe2iso, plus a `.cue` next to it.
     Mkdisc {
@@ -176,10 +199,16 @@ fn seconds(secs: f64, what: &str) -> Result<Duration> {
 /// How long to PING at each rate other than --baud before trying the next.
 const PROBE_WAIT: Duration = Duration::from_secs(1);
 
-async fn attach(link: &Link) -> Result<Session<SerialTransport>> {
+/// How long to wait for a HELLO pending on the ATCONS card before PINGing.
+const HELLO_WAIT: Duration = Duration::from_millis(300);
+
+async fn attach(link: &Link) -> Result<MonSession> {
+    if let Some(base) = atcons::parse_port(&link.port) {
+        return attach_atcons(link, base.map_err(anyhow::Error::msg)?).await;
+    }
     let io = SerialTransport::open(&link.port, link.baud)
         .with_context(|| format!("opening {}", link.port))?;
-    let mut s = Session::new(io);
+    let mut s: MonSession = Session::new(Box::new(io));
     // A monitor an earlier SET_BAUD left at a faster rate does not answer at
     // --baud, so fall back to the rates it can have been left at: the boot
     // rate, 230400 (reload 9), and whatever --fast-reload names.
@@ -210,6 +239,71 @@ async fn attach(link: &Link) -> Result<Session<SerialTransport>> {
         }
     }
     Ok(s)
+}
+
+/// Attach on the ATCONS card: read the HELLO the monitor may have left in
+/// the word channel at start-up (a later reader would otherwise take it for
+/// a reply), then PING.
+async fn attach_atcons(link: &Link, base: u16) -> Result<MonSession> {
+    if link.fast_reload.is_some() {
+        bail!("--fast-reload: ATCONS has no line rate");
+    }
+    let io = AtconsTransport::open(base)
+        .with_context(|| format!("opening the ATCONS card at 0x{base:04x}"))?;
+    let mut s: MonSession = Session::new(Box::new(io));
+    s.wait_frame(&[HELLO], deadline_after(HELLO_WAIT)).await?;
+    let wait = seconds(link.attach_timeout, "--attach-timeout")?;
+    if !s.ping(wait, &[]).await? {
+        bail!("no PONG from the monitor on the ATCONS card at 0x{base:04x}");
+    }
+    s.take_text();
+    Ok(s)
+}
+
+/// Reset the H2700's PS1 through the card, and with mode 7 show the boot's
+/// console text and wait for the monitor's HELLO.
+async fn h2700_reset(port: &str, mode: u8, connect: bool, console: f64) -> Result<ExitCode> {
+    let base = atcons::parse_port(port)
+        .with_context(|| format!("{port}: not an ATCONS port (want atcons[:BASE])"))?
+        .map_err(anyhow::Error::msg)?;
+    let mut ports = atcons::IoPorts::open(base)
+        .with_context(|| format!("opening the ATCONS card at 0x{base:04x}"))?;
+    let reply = atcons::reset_card(&mut ports, mode, connect);
+    eprintln!("psxmon: reset the card at 0x{base:04x} into mode {mode}");
+    if !connect {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if mode != 7 || console <= 0.0 {
+        match reply {
+            Some(r) => eprintln!("psxmon: connect reply 0x{r:02x}"),
+            None => eprintln!("psxmon: no connect reply"),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut sink = stdout_console();
+    // Under the monitor the "reply" is the first byte of the boot's console
+    // text (the stock BIOS answers the connect byte; OpenBIOS takes it as a
+    // keypress).
+    if let Some(r) = reply {
+        sink(&[r]);
+    }
+    let mut s = Session::new(AtconsTransport::with_ports(ports));
+    s.set_console(Some(sink));
+    let deadline = deadline_after(seconds(console, "--console")?);
+    match s.wait_frame(&[HELLO], deadline).await? {
+        Some(h) => {
+            let w = |i: usize| h.words.get(i).copied().unwrap_or(0);
+            let bios = u32::from(w(2)) | (u32::from(w(3)) << 16);
+            eprintln!(
+                "psxmon: HELLO protocol {} caps {} bios 0x{bios:08x} {}",
+                w(0),
+                describe_caps(w(1)),
+                bios::bios_name(bios)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        None => bail!("no HELLO from the monitor within {console} s"),
+    }
 }
 
 fn describe_caps(caps: u16) -> String {
@@ -292,9 +386,12 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
     }
     if verbose {
         eprintln!(
-            "psxmon: load took {} ms at {} baud; run pc=0x{:08x} gp=0x{:08x} sp=0x{:08x}",
+            "psxmon: load took {} ms {}; run pc=0x{:08x} gp=0x{:08x} sp=0x{:08x}",
             t0.elapsed().as_millis(),
-            psxmon::Transport::baud_rate(s.transport()),
+            match s.transport().baud_rate() {
+                0 => "on ATCONS".to_string(),
+                b => format!("at {b} baud"),
+            },
             image.pc,
             image.gp,
             image.sp
@@ -305,7 +402,7 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
         let _ = out.write_all(bytes);
         let _ = out.flush();
     })));
-    let deadline = psxmon::session::deadline_after(seconds(timeout, "--timeout")?);
+    let deadline = deadline_after(seconds(timeout, "--timeout")?);
     s.run(image.pc, image.gp, image.sp).await?;
     let result = s.run_until_stop(deadline, server.as_mut()).await?;
     if let Some(sv) = server.as_mut() {
@@ -522,6 +619,12 @@ async fn dispatch(cmd: Cmd) -> Result<ExitCode> {
             monitor,
             output,
         } => patch_h2700(&stock, &monitor, &output),
+        Cmd::H2700Reset {
+            mode,
+            port,
+            no_connect,
+            console,
+        } => h2700_reset(&port, mode, !no_connect, console).await,
         Cmd::Mkdisc {
             exe,
             output,

@@ -351,6 +351,17 @@ impl AsyncWrite for MemTransport {
     }
 }
 
+/// Any transport, chosen at run time (a serial port or the ATCONS card).
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn set_baud_rate(&mut self, baud: u32) -> io::Result<()> {
+        (**self).set_baud_rate(baud)
+    }
+
+    fn baud_rate(&self) -> u32 {
+        (**self).baud_rate()
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::io::{Read, Write};
