@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use gdbstub::stub::DisconnectReason;
 use psxmon::gdb::MonTarget;
 use psxmon::pcdrv::{PcdrvServer, Quota};
-use psxmon::proto::{self, CAP_LZ4, STOP_EXIT};
+use psxmon::proto::{self, CAP_LZ4, CAP_SLOT, CAP_STOP, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session};
 use psxmon::{SerialTransport, bios, exe, h2700, iso, lz4};
 
@@ -216,6 +216,12 @@ fn describe_caps(caps: u16) -> String {
     let mut names = vec![];
     if caps & CAP_LZ4 != 0 {
         names.push("lz4");
+    }
+    if caps & CAP_STOP != 0 {
+        names.push("stop");
+    }
+    if caps & CAP_SLOT != 0 {
+        names.push("slot");
     }
     format!(
         "0x{caps:04x} ({})",

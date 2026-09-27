@@ -20,11 +20,16 @@
 //! - PCDRV calls and `break 4, 0` exits are served while the target runs,
 //!   exactly as `psxmon run` does; gdb never sees them, except that an exit
 //!   is reported as the process exiting.
-//! - The monitor does not read the link while the target runs, so gdb's
-//!   Ctrl-C cannot be delivered; it is accepted and ignored.
+//! - gdb's Ctrl-C sends STOP while the target runs, when the monitor has
+//!   `CAP_STOP`. The monitor halts the target at its next interrupt and
+//!   reports STOPPED INTERRUPT, which goes to gdb as SIGINT. STOP is sent
+//!   again every [`STOP_RESEND`] until a stop comes, since one that crosses
+//!   a stop on the wire is dropped by the halted monitor. A target that
+//!   takes no interrupts cannot be stopped this way, and neither can one
+//!   under a monitor without `CAP_STOP`: there the interrupt is ignored.
 
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gdbstub::common::Signal;
 use gdbstub::conn::{Connection, ConnectionExt};
@@ -65,6 +70,8 @@ use crate::transport::Transport;
 const POLL: Duration = Duration::from_millis(50);
 /// How long a freshly loaded program gets to reach its entry break.
 const START_WAIT: Duration = Duration::from_secs(5);
+/// How long after a STOP with no stop it is sent again.
+const STOP_RESEND: Duration = Duration::from_secs(1);
 
 /// `break 0x3ff, 0`: the word psxmon plants for a single step and at a
 /// program's entry. Any other `break` is the program's or gdb's.
@@ -127,6 +134,8 @@ pub struct MonTarget<T: Transport> {
     rom_bp: Option<u32>,
     watch: Option<Watch>,
     pending: Pending,
+    /// When STOP was last sent for gdb's interrupt, until the next stop.
+    stop_sent: Option<Instant>,
     /// The target's exit code, once it has executed `break 4, 0`.
     pub exit_code: Option<u32>,
     /// Log stops, steps and breakpoint changes to stderr.
@@ -145,6 +154,7 @@ impl<T: Transport> MonTarget<T> {
             rom_bp: None,
             watch: None,
             pending: Pending::Halted,
+            stop_sent: None,
             exit_code: None,
             verbose: false,
         }
@@ -360,8 +370,12 @@ impl<T: Transport> MonTarget<T> {
                 Some(st) => Pending::Stepping(st),
                 None => Pending::Running,
             };
+            if self.stop_sent.is_some_and(|t| t.elapsed() >= STOP_RESEND) {
+                self.send_stop()?;
+            }
             return Ok(None);
         };
+        self.stop_sent = None;
         if let Some(st) = &step {
             self.end_step(st)?;
         }
@@ -383,6 +397,27 @@ impl<T: Transport> MonTarget<T> {
             )
         });
         Ok(Some(reason))
+    }
+
+    /// gdb's interrupt while the target runs: STOP, if the monitor reads it.
+    fn interrupt(&mut self) -> Res<()> {
+        if !matches!(self.pending, Pending::Running | Pending::Stepping(_)) {
+            return Ok(());
+        }
+        if self.sess.caps & CAP_STOP == 0 {
+            eprintln!(
+                "psxmon gdb: interrupt ignored: this monitor cannot stop a running target; \
+                 waiting for a breakpoint, watch, fault or exit"
+            );
+            return Ok(());
+        }
+        self.log(|| "interrupt: STOP, the target halts at its next interrupt".into());
+        self.send_stop()
+    }
+
+    fn send_stop(&mut self) -> Res<()> {
+        self.stop_sent = Some(Instant::now());
+        self.rt.block_on(self.sess.send(STOP, &[]))
     }
 
     fn classify(&self, stop: &Stop, step: Option<&StepState>) -> SingleThreadStopReason<u32> {
@@ -426,6 +461,7 @@ impl<T: Transport> MonTarget<T> {
                 12 => Signal::SIGFPE,
                 _ => Signal::SIGSEGV,
             }),
+            STOP_INTERRUPT => sig(Signal::SIGINT),
             _ => sig(Signal::SIGTRAP),
         }
     }
@@ -811,14 +847,10 @@ impl<T: Transport> BlockingEventLoop for EventLoop<T> {
         }
     }
 
-    /// The monitor does not read the link while the target runs, so there
-    /// is no way to stop it: keep waiting for it to stop on its own.
+    /// Send STOP (see [`MonTarget::interrupt`]) and keep waiting: the stop
+    /// comes back through `wait_for_stop_reason` as SIGINT.
     fn on_interrupt(target: &mut MonTarget<T>) -> Result<Option<Self::StopReason>, SessionError> {
-        eprintln!(
-            "psxmon gdb: interrupt ignored: the monitor cannot stop a running target; \
-             waiting for a breakpoint, watch, fault or exit"
-        );
-        let _ = target;
+        target.interrupt()?;
         Ok(None)
     }
 }

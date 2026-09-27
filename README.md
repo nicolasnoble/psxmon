@@ -106,10 +106,15 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   delay slot), plants `break 0x3ff, 0` at the successor in RAM, or lends
   the exec breakpoint to a successor in ROM, continues, and restores
   everything at the stop.
-- Ctrl-C cannot stop a running target: the monitor does not read the link
-  while the target runs. psxmon accepts the interrupt and keeps waiting for
-  a breakpoint, watch, fault or exit. A target that never stops needs a
-  reset.
+- Ctrl-C stops a running target when the monitor reports the `stop`
+  capability (`psxmon ping` lists it): psxmon sends STOP, the monitor
+  halts the target at its next interrupt, and gdb sees SIGINT with the PC
+  where it was. STOP is resent every second until a stop comes. A target
+  that has interrupts off, or never unmasks one, does not stop; nor does
+  any target under a monitor without the capability (older monitors,
+  ATCONS on the DTL-H2700), where psxmon ignores the interrupt and keeps
+  waiting for a breakpoint, watch, fault or exit. `psxmon run` is
+  unchanged.
 - Faults are reported as signals: address errors and bus errors as
   SIGBUS, reserved instruction and coprocessor unusable as SIGILL,
   overflow as SIGFPE. The monitor cannot deliver a signal, so continuing

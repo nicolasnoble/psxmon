@@ -47,6 +47,13 @@ pub const LZ4_FLAG: u16 = 0x8000;
 
 /// Capability bit: WRITE_MEM and LOAD accept [`LZ4_FLAG`].
 pub const CAP_LZ4: u16 = 0x0001;
+/// Capability bit: the monitor reads STOP while the target runs, and stops
+/// it with reason [`STOP_INTERRUPT`] at the target's next interrupt.
+pub const CAP_STOP: u16 = 0x0002;
+/// Capability bit: the monitor is entered from the kernel exception
+/// handler's patch slot, ahead of the handler chains, so a program that
+/// resets the chains keeps it.
+pub const CAP_SLOT: u16 = 0x0004;
 
 // ERROR codes.
 pub const E_BADCMD: u16 = 0x01;
