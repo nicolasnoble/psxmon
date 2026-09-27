@@ -8,8 +8,10 @@ pub const PS_EXE_HEADER_SIZE: usize = 2048;
 /// Stack top for a PS-EXE that sets none (`s_addr + s_size == 0`), as the
 /// reference host uses.
 pub const DEFAULT_STACK: u32 = 0x801f_fff0;
-/// Stack top for ELF and CPE programs, which carry none.
-pub const DEFAULT_STACK_ELF_CPE: u32 = 0x801f_ff00;
+/// Stack top for ELF and CPE programs, which carry none: the top of 8 MB,
+/// which a 2 MB console with the BIOS's 8 MB RAM window mirrors to the top of
+/// its 2 MB.
+pub const DEFAULT_STACK_ELF_CPE: u32 = 0x807f_ff00;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
@@ -563,7 +565,7 @@ mod tests {
         let img = parse(&build_elf(true)).expect("parse ELF");
         assert_eq!(img.pc, 0x8001_0000);
         assert_eq!(img.gp, 0x8001_8000);
-        assert_eq!(img.sp, DEFAULT_STACK_ELF_CPE);
+        assert_eq!(img.sp, 0x807f_ff00);
         // The header segment is skipped; the program segment spans .text
         // through .data, gap included, and no BSS.
         assert_eq!(img.segments.len(), 1);
@@ -611,7 +613,7 @@ mod tests {
         f.push(0x00);
         let img = parse(&f).expect("parse CPE");
         assert_eq!(img.pc, 0x8001_0010);
-        assert_eq!((img.gp, img.sp), (0, DEFAULT_STACK_ELF_CPE));
+        assert_eq!((img.gp, img.sp), (0, 0x807f_ff00));
         assert_eq!(
             img.segments,
             vec![

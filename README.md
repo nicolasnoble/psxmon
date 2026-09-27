@@ -33,7 +33,8 @@ or `0x` hex.
 - Programs can be PS-EXE, ELF or CPE, told apart by their magic. An ELF
   loads its PT_LOAD segments at their physical addresses, minus the header
   sections, and starts at `e_entry` with gp from `_gp`. A CPE loads its load
-  chunks and starts at register 0x90. ELF and CPE get sp 0x801FFF00.
+  chunks and starts at register 0x90. ELF and CPE get sp 0x807FFF00, the top
+  of 8 MB, which a 2 MB console mirrors to the top of its RAM.
 - LZ4 is used when the monitor advertises it and it shrinks the program. The
   compressor caps every match at `--max-match` bytes, because the monitor
   decodes while it receives and cannot pause the sender inside a frame.
