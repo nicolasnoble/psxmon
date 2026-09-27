@@ -19,8 +19,8 @@ clap = { version = "4", features = ["derive", "env"] }
 gdbstub = "0.7"
 gdbstub_arch = "0.3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std"] }
-tokio-serial = "5.4"
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std", "sync"] }
+serialport = { version = "4.10", default-features = false }
 
 [dev-dependencies]
 lz4_flex = "0.11"
