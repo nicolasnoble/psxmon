@@ -17,6 +17,7 @@ binary is a thin command line on top of it.
     psxmon ping --port DEV [--baud 115200]
     psxmon dump <addr> <len> -o FILE --port DEV
     psxmon write <addr> <file> --port DEV
+    psxmon patch-h2700 <stock> <monitor> -o FILE
 
 `--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
 or `0x` hex.
@@ -42,6 +43,12 @@ or `0x` hex.
   answered.
 - `ping` prints the protocol version, the capability bits, and the BIOS
   checksum with its name from a table of retail BIOS images.
+- `patch-h2700` builds a flash image for the H2700 from a dump of the
+  cart's own 512 KiB flash and the OpenBIOS monitor ELF: the monitor goes
+  into the code cave at 0xbfc40000 and the stock entry jump is pointed at
+  its hook. It refuses anything that is not an unpatched H2700 flash. With
+  the reset-mode switch at 7 the cart boots the monitor; any other mode
+  boots the stock BIOS.
 
 ## Exit status
 

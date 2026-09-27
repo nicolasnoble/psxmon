@@ -1,7 +1,7 @@
 //! psxmon: command-line host for the PS1 debug monitor.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::{self, CAP_LZ4, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session};
-use psxmon::{SerialTransport, bios, exe, lz4};
+use psxmon::{SerialTransport, bios, exe, h2700, lz4};
 
 /// Largest target exit code passed through as the process exit status;
 /// anything above it (or negative) exits with this value.
@@ -103,6 +103,15 @@ enum Cmd {
         file: PathBuf,
         #[command(flatten)]
         link: Link,
+    },
+    /// Build an H2700 flash image: STOCK, a dump of the cart's own flash,
+    /// with the OpenBIOS monitor (MONITOR, the openbios-h2700 ELF from a
+    /// release) in its code cave and the entry jump pointed at it.
+    PatchH2700 {
+        stock: PathBuf,
+        monitor: PathBuf,
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
     },
 }
 
@@ -293,6 +302,20 @@ async fn write(addr: u32, file: PathBuf, link: Link) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn patch_h2700(stock: &Path, monitor: &Path, output: &Path) -> Result<ExitCode> {
+    let flash = std::fs::read(stock).with_context(|| format!("reading {}", stock.display()))?;
+    let mon = exe::load(monitor).with_context(|| format!("loading {}", monitor.display()))?;
+    let img = h2700::patch(&flash, &mon).with_context(|| stock.display().to_string())?;
+    std::fs::write(output, img).with_context(|| format!("writing {}", output.display()))?;
+    eprintln!(
+        "psxmon: {}: monitor {} bytes, entry 0x{:08x}",
+        output.display(),
+        mon.total_bytes(),
+        mon.pc
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The process exit status for a target exit code: the code itself when it
 /// is 0..=123, else 123, so it never reads as one of psxmon's own statuses.
 fn exit_status(code: u32) -> u8 {
@@ -315,6 +338,11 @@ async fn main() -> ExitCode {
             link,
         } => dump(addr, len, output, link).await,
         Cmd::Write { addr, file, link } => write(addr, file, link).await,
+        Cmd::PatchH2700 {
+            stock,
+            monitor,
+            output,
+        } => patch_h2700(&stock, &monitor, &output),
     };
     result.unwrap_or_else(|e| {
         eprintln!("psxmon: {e:#}");
