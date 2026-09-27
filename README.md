@@ -2,13 +2,14 @@
 
 Host tool for the PS1 debug monitor. The monitor is part of
 [nugget](https://github.com/pcsx-redux/nugget), in
-[`monitor/`](https://github.com/pcsx-redux/nugget/tree/main/monitor), not
-of the PCSX-Redux emulator. The release images are built from the nugget
-submodule here. psxmon speaks wire protocol version 2,
-described in [`monitor/PROTOCOL.md`](https://github.com/pcsx-redux/nugget/blob/main/monitor/PROTOCOL.md). It talks to the monitor through a
-serial port, or through the DTL-H2700's ISA card (ATCONS). With it you can upload and run a program, stream the
-program's console text, serve its PCDRV file I/O from a host directory,
-and read or write target memory.
+[`monitor/`](https://github.com/pcsx-redux/nugget/tree/main/monitor). The
+release images are built from the nugget submodule here. psxmon speaks wire
+protocol version 2, described in
+[`monitor/PROTOCOL.md`](https://github.com/pcsx-redux/nugget/blob/main/monitor/PROTOCOL.md).
+It talks to the monitor through a serial port, or through the DTL-H2700's
+ISA card (ATCONS). With it you can upload and run a program, debug it with
+gdb, stream its console text, serve its PCDRV file I/O from a host
+directory, and read or write target memory.
 
 A library (`psxmon`) holds the protocol and the session logic. The `psxmon`
 binary is a thin command line on top of it.
@@ -50,7 +51,7 @@ or `0x` hex.
   0x801FFFF0 if zero) come from the first PS-EXE loaded, so a MiniPSF
   starts at its library's entry point. Missing libraries are skipped with a
   warning.
-- LZ4 is used when the monitor advertises it and it shrinks the program. The
+- LZ4 is used when the monitor advertises it and it shrinks the upload. The
   compressor caps every match at `--max-match` bytes, because the monitor
   decodes while it receives and cannot pause the sender inside a frame.
 - `--fast-reload 9` switches SIO1 to 230400 baud after attaching (SET_BAUD
@@ -145,16 +146,11 @@ Use it with `gdb-multiarch` or any `mips` gdb:
 - Console text goes to psxmon's stdout. PCDRV calls are served from
   `--pcdrv` while the target runs, exactly as with `run`; gdb never sees
   them.
-- Software breakpoints are gdb's own. psxmon does not offer `Z0`, so gdb
-  writes its `break` instructions into RAM itself, and the monitor stops on
-  them with the PC on the break, where gdb expects it. psxmon sends a
-  memory map with the BIOS (`0x1fc00000`) and EXP1 (`0x1f000000`) regions
-  marked read-only, in kuseg, kseg0 and kseg1, so gdb uses a hardware
-  breakpoint for `break` there. A memory write that does not take in ROM
-  returns an error to gdb.
+- Software breakpoints are gdb's own: it writes `break` instructions into
+  RAM itself.
 - Hardware breakpoints (`hbreak`, or `break` in ROM): the monitor's one
   cop0 exec breakpoint, kept for ROM. One at a time; `hbreak` in RAM is
-  refused (use `break`).
+  refused (use `break` for a software breakpoint instead).
 - Watchpoints (`watch`, `rwatch`, `awatch`): the one cop0 data breakpoint.
   The length must be a power of two and the address aligned to it. The
   unit compares the address the CPU issues, so a word store that covers a
@@ -164,17 +160,9 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   debug unit, so psxmon re-arms it with SET_BP before every CONT, and turns
   it off after every other stop so the monitor's own memory accesses cannot
   trip it.
-- Single step: the target description says `<osabi>none</osabi>`, so gdb
-  sends `vCont;s` rather than stepping with breakpoints of its own. psxmon
-  steps on the host: it decodes the instruction at PC (branches and jumps with their
-  delay slot), plants `break 0x3ff, 0` at the successor in RAM, or lends
-  the exec breakpoint to a successor in ROM, continues, and restores
-  everything at the stop.
-- Ctrl-C stops a running target when the monitor reports the `stop`
-  capability (`psxmon ping` lists it): psxmon sends STOP, the monitor
-  halts the target at its next interrupt, and gdb sees SIGINT with the PC
-  where it was. STOP is resent every second until a stop comes. A target
-  that has interrupts off, or never unmasks one, does not stop; nor does
+- Ctrl-C stops a running target at its next interrupt when the monitor
+  reports the `stop` capability (`psxmon ping` lists it). A target that has
+  interrupts off, or never unmasks one, does not stop; nor does
   any target under a monitor without the capability (older monitors,
   ATCONS on the DTL-H2700), where psxmon ignores the interrupt and keeps
   waiting for a breakpoint, watch, fault or exit. `psxmon run` is
@@ -201,8 +189,7 @@ without exiting (a fault or another breakpoint).
 
 Each [release](https://github.com/pcsx-redux/psxmon/releases/latest) carries
 psxmon for three hosts and the monitor images, built from the nugget
-submodule. The links fetch the latest release. In v0.1.0 each disc is a
-loose `.bin` and `.cue`; later releases zip the pair.
+submodule. The links fetch the latest release.
 
 | File | What it is | Link | How to use it | Run on hardware |
 |---|---|---|---|---|
