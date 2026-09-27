@@ -139,9 +139,10 @@ enum Cmd {
         #[command(flatten)]
         link: Link,
     },
-    /// Build an H2700 flash image: STOCK, a dump of the cart's own flash,
-    /// with the OpenBIOS monitor (MONITOR, the openbios-h2700 ELF from a
-    /// release) in its code cave and the entry jump pointed at it.
+    /// Build an H2700 flash image: STOCK, a dump of the cart's own flash or
+    /// the FLASH27 kit's H2700.IMG, with the OpenBIOS monitor (MONITOR, the
+    /// openbios-h2700 ELF from a release) in its code cave and the entry
+    /// jump pointed at it.
     PatchH2700 {
         stock: PathBuf,
         monitor: PathBuf,
@@ -538,9 +539,10 @@ async fn write(addr: u32, file: PathBuf, link: Link) -> Result<ExitCode> {
 }
 
 fn patch_h2700(stock: &Path, monitor: &Path, output: &Path) -> Result<ExitCode> {
-    let flash = std::fs::read(stock).with_context(|| format!("reading {}", stock.display()))?;
+    let stock_bytes =
+        std::fs::read(stock).with_context(|| format!("reading {}", stock.display()))?;
     let mon = exe::load(monitor).with_context(|| format!("loading {}", monitor.display()))?;
-    let img = h2700::patch(&flash, &mon).with_context(|| stock.display().to_string())?;
+    let img = h2700::patch(&stock_bytes, &mon).with_context(|| stock.display().to_string())?;
     std::fs::write(output, img).with_context(|| format!("writing {}", output.display()))?;
     eprintln!(
         "psxmon: {}: monitor {} bytes, entry 0x{:08x}",

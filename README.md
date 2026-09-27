@@ -62,12 +62,15 @@ or `0x` hex.
   answered.
 - `ping` prints the protocol version, the capability bits, and the BIOS
   checksum with its name from a table of retail BIOS images.
-- `patch-h2700` builds a flash image for the H2700 from a dump of the
-  cart's own 512 KiB flash and the OpenBIOS monitor ELF: the monitor goes
-  into the code cave at 0xbfc40000 and the stock entry jump is pointed at
-  its hook. It refuses anything that is not an unpatched H2700 flash. With
-  the reset-mode switch at 7 the cart boots the monitor; any other mode
-  boots the stock BIOS.
+- `patch-h2700` builds a flash image for the H2700 from the OpenBIOS
+  monitor ELF and STOCK, either a dump of the cart's own 512 KiB flash or
+  the FLASH27 kit's `H2700.IMG` (patched in place, same length, only its
+  embedded flash touched): the monitor goes into the code cave at
+  0xbfc40000 and the stock entry jump is pointed at its hook. It refuses
+  anything that is not one of those two unpatched shapes. With the
+  reset-mode switch at 7 the cart boots the monitor; any other mode boots
+  the stock BIOS. See "Flashing a DTL-H2700" below for writing the result
+  to real hardware.
 - `mkdisc` builds a bootable disc image with the PS-EXE as `PSX.EXE`: a
   Mode 2 `.bin` identical to PCSX-Redux's `exe2iso`, and a `.cue` beside it.
   Sectors 0-15 hold `--license` (an SDK file in 2336-byte sectors or a raw
@@ -99,6 +102,38 @@ and pass the pty:
 
     socat PTY,link=/tmp/psx,raw,echo=0 TCP:127.0.0.1:6699 &
     psxmon run prog.ps-exe --port /tmp/psx
+
+## Flashing a DTL-H2700
+
+Rewriting the cart's own flash needs Sony's FLASH27 kit
+(`pssn/bin/FLASH27` in the PS1 SDK), which this repo has no license to
+carry a copy of. It runs on an MS-DOS PC with the DTL-H2700 on its ISA
+bus, at the I/O base `FLASH.BAT` is given:
+
+    flash 1340
+
+`FLASH.BAT` runs `psxcons -p0x1340,0 auto`, which runs the kit's AUTO
+script: dip-switch mode 2, reset, load and run `H2700.img` on the board
+(`down2` then `call`), then `mode27 flash` and another reset to commit
+it. Per `README_E.TXT`, "Make sure that DEXBIOS is in the 'Remove' state
+as it is executed."
+
+`H2700.IMG` is itself a small PS-X EXE (a flash programmer) carrying the
+stock 512 KiB flash image as its payload. `patch-h2700` takes it directly,
+patching the embedded payload and leaving the programmer bytes around it
+alone; write the result to a new file, then replace the kit's own copy
+before running `FLASH.BAT`:
+
+    psxmon patch-h2700 H2700.IMG openbios-atcons-h2700.elf -o H2700.patched.img
+    cp H2700.patched.img /path/to/FLASH27/H2700.IMG
+    cd /path/to/FLASH27 && flash 1340
+
+`patch-h2700` also still takes a raw 512 KiB dump of the cart's own flash,
+when that is what is on hand; it refuses anything that is neither shape.
+
+After flashing, `psxmon h2700-reset` (`--mode 7`, the default) boots the
+monitor from the cave; any other `--mode` boots the stock BIOS, same as
+before the flash was patched.
 
 ## DTL-H2700 (ATCONS)
 
