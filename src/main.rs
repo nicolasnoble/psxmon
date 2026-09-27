@@ -12,7 +12,10 @@ use psxmon::gdb::MonTarget;
 use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::{self, CAP_LZ4, CAP_SLOT, CAP_STOP, HELLO, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session, deadline_after};
-use psxmon::{AtconsTransport, SerialTransport, Transport, atcons, bios, exe, h2700, iso, lz4};
+use psxmon::transport::parse_tcp_port;
+use psxmon::{
+    AtconsTransport, SerialTransport, TcpTransport, Transport, atcons, bios, exe, h2700, iso, lz4,
+};
 
 /// A session on whichever link --port names.
 type MonSession = Session<Box<dyn Transport>>;
@@ -40,11 +43,14 @@ struct Cli {
 
 #[derive(Args)]
 struct Link {
-    /// Serial device the monitor is on, or `atcons[:BASE]` for the
-    /// DTL-H2700's ISA card (base 0x1340 by default; x86 Linux, root).
+    /// Serial device the monitor is on; `tcp:HOST:PORT` (or
+    /// `tcp://HOST:PORT`) for a TCP link such as PCSX-Redux's SIO1 server;
+    /// or `atcons[:BASE]` for the DTL-H2700's ISA card (base 0x1340 by
+    /// default; x86 Linux, root).
     #[arg(long, env = "PSXMON_PORT")]
     port: String,
-    /// Line rate the monitor listens at after boot (not used on ATCONS).
+    /// Line rate the monitor listens at after boot (not used on TCP or
+    /// ATCONS).
     #[arg(long, default_value_t = 115200)]
     baud: u32,
     /// SIO1 reload to switch to after attaching (9 = 230400, 5 = 414720).
@@ -206,6 +212,9 @@ async fn attach(link: &Link) -> Result<MonSession> {
     if let Some(base) = atcons::parse_port(&link.port) {
         return attach_atcons(link, base.map_err(anyhow::Error::msg)?).await;
     }
+    if let Some(addr) = parse_tcp_port(&link.port) {
+        return attach_tcp(link, addr).await;
+    }
     let io = SerialTransport::open(&link.port, link.baud)
         .with_context(|| format!("opening {}", link.port))?;
     let mut s: MonSession = Session::new(Box::new(io));
@@ -238,6 +247,25 @@ async fn attach(link: &Link) -> Result<MonSession> {
             eprintln!("psxmon: reload {reload} did not answer, staying at {rate} baud");
         }
     }
+    Ok(s)
+}
+
+/// Attach over TCP: PING until PONG. The far end owns the line rate, so
+/// there is no rate to probe or change.
+async fn attach_tcp(link: &Link, addr: &str) -> Result<MonSession> {
+    if link.fast_reload.is_some() {
+        bail!("--fast-reload: a TCP link has no line rate");
+    }
+    let io = TcpTransport::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    let mut s: MonSession = Session::new(Box::new(io));
+    let wait = seconds(link.attach_timeout, "--attach-timeout")?;
+    if !s.ping(wait, &[]).await? {
+        bail!("no PONG from the monitor at {addr}");
+    }
+    // Anything before the first PONG is boot text, not the program's.
+    s.take_text();
     Ok(s)
 }
 
@@ -389,7 +417,7 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
             "psxmon: load took {} ms {}; run pc=0x{:08x} gp=0x{:08x} sp=0x{:08x}",
             t0.elapsed().as_millis(),
             match s.transport().baud_rate() {
-                0 => "on ATCONS".to_string(),
+                0 => format!("on {}", link.port),
                 b => format!("at {b} baud"),
             },
             image.pc,

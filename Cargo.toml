@@ -20,7 +20,7 @@ gdbstub = "0.7"
 gdbstub_arch = "0.3"
 miniz_oxide = "0.9.1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std", "sync", "net"] }
 serialport = { version = "4.10", default-features = false }
 
 # ATCONS port I/O (ioperm).

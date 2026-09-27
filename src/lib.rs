@@ -18,4 +18,4 @@ pub mod transport;
 
 pub use atcons::AtconsTransport;
 pub use session::{LoadOptions, RunResult, Session, SessionError, Stop};
-pub use transport::{MemTransport, SerialTransport, Transport};
+pub use transport::{MemTransport, SerialTransport, TcpTransport, Transport};
