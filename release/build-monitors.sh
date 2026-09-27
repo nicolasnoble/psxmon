@@ -16,7 +16,8 @@
 #   openbios-ft232h-<board>.rom     same, FT232H on the expansion port
 #   openbios-atcons-h2700.elf       OpenBIOS for the H2700 code cave; turn it
 #                                   into a flash image with psxmon patch-h2700
-# Disc images of the PS-EXEs come from psxmon mkdisc, in the release workflow.
+# Disc images of the PS-EXEs come from psxmon mkdisc, zipped as .bin + .cue,
+# in the release workflow.
 set -eu
 
 out=$(realpath -m "${1:-dist}")

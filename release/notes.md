@@ -1,9 +1,9 @@
 psxmon binaries for Linux (x86_64), Windows (x86_64) and macOS (arm64), and the monitor images built from the nugget revision named below.
 
 Monitor on the retail BIOS kernel:
-- `monitor-sio1.ps-exe`, `monitor-sio1.bin`/`.cue`: load or boot it, talk to it over the serial port.
+- `monitor-sio1.ps-exe`, `monitor-sio1.zip`: load or boot it, talk to it over the serial port. The zip is the disc image, a `.bin` and its `.cue`.
 - `monitor-sio1-cart.rom`: flash cartridge image; the console boots straight into the monitor.
-- `monitor-ft232h-<board>.ps-exe`, `.bin`/`.cue`: FT232H on the expansion port, one image per board, since the link addresses are fixed at build time. Boards: `psx232h-a20`, `psx232h-a0`, `picodev-usb`, `picodev-uart`, `piodev-lite`. The `piodev-lite` addresses are read off its schematic.
+- `monitor-ft232h-<board>.ps-exe`, `.zip` (disc image): FT232H on the expansion port, one image per board, since the link addresses are fixed at build time. Boards: `psx232h-a20`, `psx232h-a0`, `picodev-usb`, `picodev-uart`, `piodev-lite`. The `piodev-lite` addresses are read off its schematic.
 
 OpenBIOS with the monitor:
 - `openbios-sio1-cart.rom`: flash cartridge image; OpenBIOS takes over from the retail BIOS at boot and runs the monitor on the serial port.

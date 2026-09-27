@@ -70,8 +70,12 @@ jobs:
           mkdir -p dist
           cp artifacts/monitors/* artifacts/psxmon-*/* dist/
           chmod +x dist/psxmon-linux-x86_64
+          # One zip per disc, holding the .bin and the .cue that names it.
           for exe in dist/monitor-*.ps-exe; do
-            dist/psxmon-linux-x86_64 mkdisc "$exe" -o "${exe%.ps-exe}.bin"
+            base="${exe%.ps-exe}"
+            dist/psxmon-linux-x86_64 mkdisc "$exe" -o "$base.bin"
+            zip -j "$base.zip" "$base.bin" "$base.cue"
+            rm "$base.bin" "$base.cue"
           done
           ls -l dist
       - name: Notes
