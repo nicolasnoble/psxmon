@@ -27,6 +27,17 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+  monitors:
+    runs-on: ubuntu-latest
+    container: ghcr.io/grumpycoders/pcsx-redux-build:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          set-safe-directory: true
+      - name: Build monitor images
+        run: release/build-monitors.sh dist
+
   build:
     strategy:
       fail-fast: false

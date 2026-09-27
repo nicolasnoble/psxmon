@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  monitors:
+    runs-on: ubuntu-latest
+    container: ghcr.io/grumpycoders/pcsx-redux-build:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          set-safe-directory: true
+      - name: Build monitor images
+        run: release/build-monitors.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitors
+          path: dist/
+
+  psxmon:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: psxmon-linux-x86_64
+            exe: psxmon
+          - os: windows-latest
+            name: psxmon-windows-x86_64.exe
+            exe: psxmon.exe
+          - os: macos-latest
+            name: psxmon-macos-arm64
+            exe: psxmon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libudev
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release build
+        run: cargo build --release
+      - name: Stage
+        shell: bash
+        run: mkdir -p out && cp target/release/${{ matrix.exe }} out/${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/
+
+  release:
+    needs: [monitors, psxmon]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Disc images
+        run: |
+          mkdir -p dist
+          cp artifacts/monitors/* artifacts/psxmon-*/* dist/
+          chmod +x dist/psxmon-linux-x86_64
+          for exe in dist/monitor-*.ps-exe; do
+            dist/psxmon-linux-x86_64 mkdisc "$exe" -o "${exe%.ps-exe}.bin"
+          done
+          ls -l dist
+      - name: Notes
+        run: |
+          cp release/notes.md notes.md
+          printf '\nMonitor images built from nugget %s.\n' "$(git ls-tree HEAD nugget | awk '{print $3}')" >> notes.md
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md dist/*
