@@ -5,9 +5,11 @@
 pub mod bios;
 pub mod exe;
 pub mod frame;
+pub mod gdb;
 pub mod h2700;
 pub mod iso;
 pub mod lz4;
+pub mod mips;
 pub mod pcdrv;
 pub mod proto;
 pub mod session;

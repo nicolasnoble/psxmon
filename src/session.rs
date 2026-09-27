@@ -84,6 +84,15 @@ impl Stop {
     pub fn reason_name(&self) -> String {
         proto::stop_reason_name(self.reason)
     }
+
+    /// A stop the cop0 debug unit caused (exec breakpoint or data watch),
+    /// which disarms the unit. A BREAKPOINT whose `a` is not a `break` word
+    /// is the exec breakpoint (or a `break` in a delay slot, which the
+    /// monitor reports the same way: PROTOCOL.md section 13).
+    pub fn is_hardware(&self) -> bool {
+        self.reason == STOP_DATA_WATCH
+            || (self.reason == STOP_BREAKPOINT && BreakCode::decode(self.a).is_none())
+    }
 }
 
 /// How `run_until_stop` ended.
@@ -124,7 +133,24 @@ pub struct LoadStats {
     pub lz4_bytes: Option<usize>,
 }
 
-type Console = Box<dyn FnMut(&[u8]) + Send>;
+pub type Console = Box<dyn FnMut(&[u8]) + Send>;
+
+/// One cop0 debug-unit breakpoint, as SET_BP takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HwBreak {
+    /// SET_BP kind: 0 exec, 1 data read, 2 data write, 3 data read/write.
+    pub kind: u16,
+    pub addr: u32,
+    pub mask: u32,
+}
+
+/// The debug-unit breakpoints the host wants armed while the target runs:
+/// the monitor has one exec and one data breakpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HwBreaks {
+    pub exec: Option<HwBreak>,
+    pub data: Option<HwBreak>,
+}
 
 pub struct Session<T: Transport> {
     io: T,
@@ -140,6 +166,12 @@ pub struct Session<T: Transport> {
     pub bios: Option<u32>,
     /// Log PCDRV calls to stderr.
     pub verbose: bool,
+    /// Debug-unit breakpoints armed with SET_BP before every CONT. A
+    /// hardware stop disarms the whole unit (PROTOCOL.md section 11), so
+    /// they are re-sent each time.
+    pub hw: HwBreaks,
+    /// Whether the monitor's debug unit may be armed right now.
+    hw_live: bool,
 }
 
 impl<T: Transport> Session<T> {
@@ -154,6 +186,8 @@ impl<T: Transport> Session<T> {
             caps: 0,
             bios: None,
             verbose: false,
+            hw: HwBreaks::default(),
+            hw_live: false,
         }
     }
 
@@ -404,7 +438,53 @@ impl<T: Transport> Session<T> {
         self.expect_ack(|| format!("SET_REG {index}"), SHORT).await
     }
 
+    pub async fn set_bp(&mut self, bp: HwBreak) -> Result<()> {
+        let mut payload = vec![bp.kind];
+        payload.extend(u32_words(&[bp.addr, bp.mask]));
+        self.send(SET_BP, &payload).await?;
+        self.expect_ack(|| format!("SET_BP {}", bp.kind), SHORT)
+            .await
+    }
+
+    pub async fn clr_bp(&mut self, kind: u16) -> Result<()> {
+        self.send(CLR_BP, &[kind]).await?;
+        self.expect_ack(|| format!("CLR_BP {kind}"), SHORT).await
+    }
+
+    /// SET_BP everything in [`Session::hw`]. The unit is off here (a
+    /// hardware stop cleared it, any other stop was followed by
+    /// [`Session::disarm`]), so SET_BP's OR into DCIC starts from zero.
+    async fn arm(&mut self) -> Result<()> {
+        for bp in [self.hw.exec, self.hw.data].into_iter().flatten() {
+            self.hw_live = true;
+            self.set_bp(bp).await?;
+        }
+        Ok(())
+    }
+
+    /// Turn the debug unit off while halted, so that the monitor's own
+    /// memory accesses in its command loop cannot trip a watch.
+    pub async fn disarm(&mut self) -> Result<()> {
+        if self.hw_live {
+            self.clr_bp(0).await?;
+            self.clr_bp(1).await?;
+            self.hw_live = false;
+        }
+        Ok(())
+    }
+
+    /// A hardware stop has already disarmed the debug unit; after any other
+    /// stop it is turned off here.
+    async fn after_stop(&mut self, stop: &Stop) -> Result<()> {
+        if stop.is_hardware() {
+            self.hw_live = false;
+        }
+        self.disarm().await
+    }
+
+    /// SET_BP the breakpoints in [`Session::hw`], then CONT.
     pub async fn cont(&mut self) -> Result<()> {
+        self.arm().await?;
         self.send(CONT, &[]).await?;
         self.expect_ack(|| "CONT".into(), SHORT).await
     }
@@ -468,6 +548,7 @@ impl<T: Transport> Session<T> {
                     a: word_u32(&f.words, 3),
                     b: word_u32(&f.words, 5),
                 };
+                self.after_stop(&stop).await?;
                 let insn = if stop.reason == STOP_BREAKPOINT {
                     stop.a
                 } else {

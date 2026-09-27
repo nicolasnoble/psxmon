@@ -7,6 +7,8 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use gdbstub::stub::DisconnectReason;
+use psxmon::gdb::MonTarget;
 use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::{self, CAP_LZ4, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session};
@@ -75,11 +77,40 @@ struct RunArgs {
     verbose: bool,
 }
 
+#[derive(Args)]
+struct GdbArgs {
+    /// Program to load (PS-EXE, ELF or CPE); gdb finds it halted on its
+    /// first instruction. Without it, gdb attaches to whatever program the
+    /// monitor has halted.
+    file: Option<PathBuf>,
+    #[command(flatten)]
+    link: Link,
+    /// Address to accept the gdb connection on.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3333")]
+    listen: String,
+    /// Send the program uncompressed.
+    #[arg(long)]
+    no_lz4: bool,
+    /// Longest LZ4 match copy per sequence.
+    #[arg(long, value_name = "BYTES", default_value_t = lz4::DEFAULT_MAX_MATCH)]
+    max_match: usize,
+    /// Serve PCDRV file I/O from this directory.
+    #[arg(long, value_name = "DIR")]
+    pcdrv: Option<PathBuf>,
+    /// Log stops, steps, breakpoints and PCDRV calls to stderr.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Upload a program, run it, stream its console text to stdout, serve
     /// PCDRV, and exit with its exit code.
     Run(RunArgs),
+    /// Serve one gdb remote connection (target remote HOST:PORT) to the
+    /// target, optionally loading a program first. Console text goes to
+    /// stdout and PCDRV is served, as with `run`.
+    Gdb(GdbArgs),
     /// Print the monitor's protocol version, capabilities and BIOS.
     Ping {
         #[command(flatten)]
@@ -297,6 +328,92 @@ async fn run(args: RunArgs) -> Result<ExitCode> {
     })
 }
 
+fn stdout_console() -> psxmon::session::Console {
+    Box::new(|bytes: &[u8]| {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+    })
+}
+
+fn gdb(args: GdbArgs) -> Result<ExitCode> {
+    let GdbArgs {
+        file,
+        link,
+        listen,
+        no_lz4,
+        max_match,
+        pcdrv,
+        verbose,
+    } = args;
+    if max_match < 7 {
+        bail!("--max-match must be at least 7");
+    }
+    let image = file
+        .as_ref()
+        .map(|f| exe::load(f).with_context(|| format!("loading {}", f.display())))
+        .transpose()?;
+    let server = match pcdrv {
+        Some(dir) => Some(
+            PcdrvServer::new(&dir, Quota::default())
+                .with_context(|| format!("PCDRV dir {}", dir.display()))?,
+        ),
+        None => None,
+    };
+    // Bind first, so a busy port fails before the target is touched.
+    let listener =
+        std::net::TcpListener::bind(&listen).with_context(|| format!("listening on {listen}"))?;
+    // gdbstub's event loop blocks, so the session gets a runtime of its own
+    // that each target operation drives with block_on.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut s = rt.block_on(attach(&link))?;
+    s.verbose = verbose;
+    s.set_console(Some(stdout_console()));
+    let mut t = MonTarget::new(rt, s, server);
+    t.verbose = verbose;
+    if let Some(img) = &image {
+        let opts = LoadOptions {
+            lz4: !no_lz4,
+            max_match,
+            ..Default::default()
+        };
+        t.start_program(img, &opts)?;
+        eprintln!(
+            "psxmon: program loaded, halted at its entry 0x{:08x}",
+            img.pc
+        );
+    } else if !t.has_context()? {
+        eprintln!(
+            "psxmon: the monitor has no halted program: gdb will read zeroed registers \
+             and cannot continue or step"
+        );
+    }
+    eprintln!("psxmon: waiting for gdb on {listen}");
+    let (conn, peer) = listener.accept().context("accepting the gdb connection")?;
+    conn.set_nodelay(true)?;
+    eprintln!("psxmon: gdb connected from {peer}");
+    let reason = t.serve(conn)?;
+    if let Some(sv) = t.pcdrv_mut() {
+        sv.close_all();
+    }
+    Ok(match (reason, t.exit_code) {
+        (_, Some(code)) => {
+            eprintln!("psxmon: exit code {code} (0x{code:x})");
+            ExitCode::from(exit_status(code))
+        }
+        (DisconnectReason::Kill, None) => {
+            eprintln!("psxmon: gdb killed the session; target left halted");
+            ExitCode::SUCCESS
+        }
+        (_, None) => {
+            eprintln!("psxmon: gdb detached; target left halted");
+            ExitCode::SUCCESS
+        }
+    })
+}
+
 async fn dump(addr: u32, len: u32, output: PathBuf, link: Link) -> Result<ExitCode> {
     let mut s = attach(&link).await?;
     let data = s.read_mem(addr, len).await?;
@@ -365,10 +482,26 @@ fn exit_status(code: u32) -> u8 {
         .unwrap_or(EXIT_CODE_MAX)
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
+        Cmd::Gdb(args) => gdb(args),
+        cmd => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(dispatch(cmd))),
+    };
+    result.unwrap_or_else(|e| {
+        eprintln!("psxmon: {e:#}");
+        ExitCode::from(EXIT_ERROR)
+    })
+}
+
+async fn dispatch(cmd: Cmd) -> Result<ExitCode> {
+    match cmd {
+        // Runs its own runtime; main() calls it outside this one.
+        Cmd::Gdb(_) => bail!("gdb cannot run inside the async dispatcher"),
         Cmd::Run(args) => run(args).await,
         Cmd::Ping { link } => ping(link).await,
         Cmd::Dump {
@@ -389,11 +522,7 @@ async fn main() -> ExitCode {
             license,
             no_pad,
         } => mkdisc(&exe, &output, license.as_deref(), !no_pad),
-    };
-    result.unwrap_or_else(|e| {
-        eprintln!("psxmon: {e:#}");
-        ExitCode::from(EXIT_ERROR)
-    })
+    }
 }
 
 #[cfg(test)]

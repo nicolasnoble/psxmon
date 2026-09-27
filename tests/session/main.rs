@@ -1,6 +1,8 @@
 //! Session behaviour against the simulated monitor.
 #![cfg(test)]
 
+// The interpreter and debug unit serve tests/gdb.
+#[allow(dead_code)]
 mod sim;
 
 use std::sync::{Arc, Mutex, MutexGuard};

@@ -1,7 +1,8 @@
 //! A fake monitor for tests: speaks the SIO1 byte-stream protocol the way
 //! monitor.c and transport.c do, over the in-memory transport, with 2 MiB of
 //! RAM, a register file, SET_BAUD with its two windows, and a scripted
-//! target program that prints, makes PCDRV breaks and exits.
+//! target program that prints, makes PCDRV breaks and exits, or an R3000
+//! subset interpreter with the cop0 debug unit (SET_BP / CLR_BP) and a ROM.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,9 +31,29 @@ pub const GP: u16 = 28;
 pub const SP: u16 = 29;
 pub const FP: u16 = 30;
 
+/// Physical base of the BIOS ROM.
+pub const ROM_BASE: u32 = 0x1fc0_0000;
+
+/// The cop0 debug unit as the monitor drives it (PROTOCOL.md section 11).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DebugUnit {
+    /// PCE.
+    pub exec: bool,
+    /// DR (bit 0) and DW (bit 1), with DAE.
+    pub data: u16,
+    pub bpc: u32,
+    pub bpcm: u32,
+    pub bda: u32,
+    pub bdam: u32,
+    pub watch_addr: u32,
+}
+
 pub struct Machine {
     pub ram: Vec<u8>,
+    /// BIOS ROM contents at [`ROM_BASE`]; writes do not reach it.
+    pub rom: Vec<u8>,
     pub regs: [u32; NUM_REGS],
+    pub dbg: DebugUnit,
 }
 
 impl Machine {
@@ -42,19 +63,35 @@ impl Machine {
             .filter(|&p| p < RAM_SIZE)
     }
 
+    fn rom_off(addr: u32) -> Option<usize> {
+        (addr & 0x1fff_ffff)
+            .checked_sub(ROM_BASE)
+            .and_then(|o| usize::try_from(o).ok())
+    }
+
+    fn byte(&self, at: u32) -> u8 {
+        Self::phys(at)
+            .and_then(|p| self.ram.get(p))
+            .or_else(|| Self::rom_off(at).and_then(|o| self.rom.get(o)))
+            .copied()
+            .unwrap_or(0)
+    }
+
     // Byte addresses advance in the 32-bit address space, which wraps.
     pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {
         let mut at = addr;
         (0..len)
             .map(|_| {
-                let b = Self::phys(at)
-                    .and_then(|p| self.ram.get(p))
-                    .copied()
-                    .unwrap_or(0);
+                let b = self.byte(at);
                 at = at.wrapping_add(1);
                 b
             })
             .collect()
+    }
+
+    pub fn read32(&self, addr: u32) -> u32 {
+        let b = self.read(addr, 4);
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
 
     pub fn write(&mut self, addr: u32, data: &[u8]) {
@@ -84,6 +121,11 @@ pub enum Step {
     Tty(Vec<u8>),
     /// A software `break` at the address in the PC register.
     Break(u32),
+    /// A debug-unit stop at the PC register: the exec breakpoint (or a
+    /// `break` in a delay slot) when `data` is false, else the data watch.
+    Hw { data: bool },
+    /// An exception the monitor reports as FAULT, ExcCode given, at PC.
+    Fault(u32),
     /// Spin forever.
     Hang,
 }
@@ -92,6 +134,13 @@ pub trait Program: Send {
     /// Called on RUN (fresh start, regs as RUN left them) and on every
     /// resume past a break.
     fn step(&mut self, m: &mut Machine) -> Step;
+
+    /// Whether CONT resumes at the PC register as it stands (a real CPU);
+    /// scripted programs instead replay the break they stopped on when CONT
+    /// finds the PC still on it.
+    fn resumes_in_place(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +156,8 @@ pub struct SimConfig {
     pub unreachable_rate: bool,
     /// The rate the sim listens at from the start (default: the host's).
     pub start_rate: Option<u32>,
+    /// BIOS ROM contents.
+    pub rom: Vec<u8>,
 }
 
 impl Default for SimConfig {
@@ -118,6 +169,7 @@ impl Default for SimConfig {
             window: Duration::from_millis(400),
             unreachable_rate: false,
             start_rate: None,
+            rom: Vec::new(),
         }
     }
 }
@@ -130,6 +182,10 @@ pub struct SimStats {
     pub max_match: usize,
     pub errors_sent: Vec<u16>,
     pub rate: u32,
+    /// Every command frame received (TYPE without the LZ4 flag), in order.
+    pub cmds: Vec<u16>,
+    /// SET_BP payloads: (kind, addr, mask).
+    pub set_bps: Vec<(u16, u32, u32)>,
 }
 
 #[derive(Default)]
@@ -169,6 +225,7 @@ impl Sim {
             rate,
             ..Default::default()
         }));
+        let rom = cfg.rom.clone();
         let sim = Sim {
             io,
             rx: VecDeque::new(),
@@ -177,7 +234,9 @@ impl Sim {
             cfg,
             m: Machine {
                 ram: vec![0; RAM_SIZE],
+                rom,
                 regs: [0; NUM_REGS],
+                dbg: DebugUnit::default(),
             },
             ctx: false,
             epc: 0,
@@ -321,6 +380,7 @@ impl Sim {
     /// One command; false when the target hangs for good.
     async fn command(&mut self, ty: u16, w: &[u16], ok: bool) -> bool {
         let base = ty & !LZ4_FLAG;
+        self.stats().cmds.push(base);
         if base == WRITE_MEM || base == LOAD {
             let reply = if ty & LZ4_FLAG == 0 {
                 self.count(|st| &mut st.plain_load_frames);
@@ -396,7 +456,7 @@ impl Sim {
                 } else {
                     self.send_status(0).await;
                     // PC left on the break re-executes it.
-                    let again = self.m.reg(REG_PC) == self.epc;
+                    let again = !self.program.resumes_in_place() && self.m.reg(REG_PC) == self.epc;
                     return self.execute(again).await;
                 }
             }
@@ -408,6 +468,37 @@ impl Sim {
                     self.send_status(0).await;
                     self.try_rate(reload).await;
                 }
+            }
+            SET_BP => {
+                let kind = w.first().copied().unwrap_or(0);
+                let (addr, mask) = (word_u32(w, 1), word_u32(w, 3));
+                self.stats().set_bps.push((kind, addr, mask));
+                let d = &mut self.m.dbg;
+                let code = match kind {
+                    0 => {
+                        d.bpc = addr;
+                        d.bpcm = mask;
+                        d.exec = true;
+                        0
+                    }
+                    1..=3 => {
+                        d.bda = addr;
+                        d.bdam = mask;
+                        d.watch_addr = addr;
+                        d.data |= kind;
+                        0
+                    }
+                    _ => E_BADCMD,
+                };
+                self.send_status(code).await;
+            }
+            CLR_BP => {
+                if w.first().copied().unwrap_or(0) == 0 {
+                    self.m.dbg.exec = false;
+                } else {
+                    self.m.dbg.data = 0;
+                }
+                self.send_status(0).await;
             }
             STOP => self.send_status(0).await,
             _ => self.send_status(E_BADCMD).await,
@@ -529,24 +620,252 @@ impl Sim {
                     self.put(&bytes).await;
                 }
                 Step::Hang => return false,
+                Step::Hw { data } => {
+                    // The monitor writes DCIC 0 whichever unit fired.
+                    let watch = self.m.dbg.watch_addr;
+                    self.m.dbg.exec = false;
+                    self.m.dbg.data = 0;
+                    let (reason, a) = if data {
+                        (STOP_DATA_WATCH, watch)
+                    } else {
+                        (STOP_BREAKPOINT, 0)
+                    };
+                    return self.stopped(reason, a, 0).await;
+                }
+                Step::Fault(code) => return self.stopped(STOP_FAULT, code, 0).await,
                 Step::Break(insn) => {
-                    self.ctx = true;
-                    self.epc = self.m.reg(REG_PC);
                     self.last_break = insn;
-                    self.m.set(REG_BADVADDR, 0);
                     let (reason, a) = if self.cfg.legacy_exit && insn == EXIT_BREAK {
                         (STOP_EXIT, self.m.reg(A0))
                     } else {
                         (STOP_BREAKPOINT, insn)
                     };
-                    let mut p = vec![reason];
-                    p.extend(u32_words(&[self.epc, a, 0]));
-                    self.send_frame(STOPPED, &p).await;
-                    return true;
+                    return self.stopped(reason, a, 0).await;
                 }
             }
             step = self.program.step(&mut self.m);
         }
+    }
+
+    /// Enter HALTED at the PC register and send STOPPED.
+    async fn stopped(&mut self, reason: u16, a: u32, b: u32) -> bool {
+        self.ctx = true;
+        self.epc = self.m.reg(REG_PC);
+        self.m.set(REG_BADVADDR, 0);
+        let mut p = vec![reason];
+        p.extend(u32_words(&[self.epc, a, b]));
+        self.send_frame(STOPPED, &p).await;
+        true
+    }
+}
+
+// ---- an R3000 subset, for debugger tests ----
+
+/// What one instruction did besides its register and memory effects.
+enum Effect {
+    Seq,
+    /// A branch or jump (it has a delay slot); Some(target) when taken.
+    Branch(Option<u32>),
+    Break,
+    Watch,
+    Fault(u32),
+}
+
+/// Runs the program in RAM (and ROM) from the PC register: enough of the
+/// R3000 for the debugger tests, with delay slots, the debug unit, and
+/// `break` in a delay slot reported the monitor's way (PROTOCOL.md 13).
+pub struct Interp {
+    /// Instructions to run per resume before the target counts as hung.
+    pub budget: u32,
+}
+
+impl Default for Interp {
+    fn default() -> Self {
+        Interp { budget: 100_000 }
+    }
+}
+
+fn sext(imm: u32) -> u32 {
+    i32::from(u16::try_from(imm & 0xffff).expect("16 bits").cast_signed()).cast_unsigned()
+}
+
+impl Interp {
+    fn exec(m: &mut Machine, pc: u32, insn: u32) -> Effect {
+        let op = insn >> 26;
+        let rs_i = u16::try_from((insn >> 21) & 31).expect("5 bits");
+        let rt_i = u16::try_from((insn >> 16) & 31).expect("5 bits");
+        let rd_i = u16::try_from((insn >> 11) & 31).expect("5 bits");
+        let (rs, rt) = (m.reg(rs_i), m.reg(rt_i));
+        let imm = insn & 0xffff;
+        let simm = sext(imm);
+        let link = pc.wrapping_add(8);
+        let target = pc.wrapping_add(4).wrapping_add(simm << 2);
+        let cond = |t: bool| Effect::Branch(t.then_some(target));
+        let watch = |m: &Machine, addr: u32, need: u16| {
+            m.dbg.data & need != 0 && (addr ^ m.dbg.bda) & m.dbg.bdam == 0
+        };
+        match op {
+            0 => {
+                let sh = (insn >> 6) & 31;
+                let v = match insn & 0x3f {
+                    0x00 => rt.wrapping_shl(sh),
+                    0x02 => rt.wrapping_shr(sh),
+                    0x03 => rt.cast_signed().wrapping_shr(sh).cast_unsigned(),
+                    0x08 => return Effect::Branch(Some(rs)),
+                    0x09 => {
+                        m.set(rd_i, link);
+                        return Effect::Branch(Some(rs));
+                    }
+                    0x0d => return Effect::Break,
+                    0x20 | 0x21 => rs.wrapping_add(rt),
+                    0x22 | 0x23 => rs.wrapping_sub(rt),
+                    0x24 => rs & rt,
+                    0x25 => rs | rt,
+                    0x26 => rs ^ rt,
+                    0x27 => !(rs | rt),
+                    0x2a => u32::from(rs.cast_signed() < rt.cast_signed()),
+                    0x2b => u32::from(rs < rt),
+                    _ => return Effect::Fault(10),
+                };
+                m.set(rd_i, v);
+                Effect::Seq
+            }
+            1 => {
+                if rt_i & 0x1e == 0x10 {
+                    m.set(31, link);
+                }
+                let neg = rs.cast_signed() < 0;
+                cond(if rt_i & 1 != 0 { !neg } else { neg })
+            }
+            2 | 3 => {
+                if op == 3 {
+                    m.set(31, link);
+                }
+                Effect::Branch(Some(
+                    (pc.wrapping_add(4) & 0xf000_0000) | ((insn & 0x03ff_ffff) << 2),
+                ))
+            }
+            4 => cond(rs == rt),
+            5 => cond(rs != rt),
+            6 => cond(rs.cast_signed() <= 0),
+            7 => cond(rs.cast_signed() > 0),
+            8 | 9 => {
+                m.set(rt_i, rs.wrapping_add(simm));
+                Effect::Seq
+            }
+            0x0a => {
+                m.set(rt_i, u32::from(rs.cast_signed() < simm.cast_signed()));
+                Effect::Seq
+            }
+            0x0b => {
+                m.set(rt_i, u32::from(rs < simm));
+                Effect::Seq
+            }
+            0x0c => {
+                m.set(rt_i, rs & imm);
+                Effect::Seq
+            }
+            0x0d => {
+                m.set(rt_i, rs | imm);
+                Effect::Seq
+            }
+            0x0e => {
+                m.set(rt_i, rs ^ imm);
+                Effect::Seq
+            }
+            0x0f => {
+                m.set(rt_i, imm << 16);
+                Effect::Seq
+            }
+            0x20 | 0x21 | 0x23 | 0x24 | 0x25 => {
+                let addr = rs.wrapping_add(simm);
+                if watch(m, addr, 1) {
+                    return Effect::Watch;
+                }
+                let v = match op {
+                    0x20 => i32::from(m.read(addr, 1)[0].cast_signed()).cast_unsigned(),
+                    0x24 => u32::from(m.read(addr, 1)[0]),
+                    0x21 | 0x25 => {
+                        let b = m.read(addr, 2);
+                        let h = u32::from(u16::from_le_bytes([b[0], b[1]]));
+                        if op == 0x21 { sext(h) } else { h }
+                    }
+                    _ => m.read32(addr),
+                };
+                m.set(rt_i, v);
+                Effect::Seq
+            }
+            0x28 | 0x29 | 0x2b => {
+                let addr = rs.wrapping_add(simm);
+                if watch(m, addr, 2) {
+                    return Effect::Watch;
+                }
+                let n = match op {
+                    0x28 => 1,
+                    0x29 => 2,
+                    _ => 4,
+                };
+                m.write(addr, &rt.to_le_bytes()[..n]);
+                Effect::Seq
+            }
+            _ => Effect::Fault(10),
+        }
+    }
+}
+
+impl Program for Interp {
+    fn resumes_in_place(&self) -> bool {
+        true
+    }
+
+    fn step(&mut self, m: &mut Machine) -> Step {
+        let mut pc = m.reg(REG_PC);
+        let mut npc = pc.wrapping_add(4);
+        // The branch whose delay slot `pc` is, if it is one.
+        let mut branch: Option<u32> = None;
+        for _ in 0..self.budget {
+            // An exception in a delay slot resumes at the branch (Cause.BD).
+            let epc = branch.unwrap_or(pc);
+            if m.dbg.exec && (pc ^ m.dbg.bpc) & m.dbg.bpcm == 0 {
+                m.set(REG_PC, epc);
+                return Step::Hw { data: false };
+            }
+            let insn = m.read32(pc);
+            let mut next = npc.wrapping_add(4);
+            let mut is_branch = false;
+            match Self::exec(m, pc, insn) {
+                Effect::Seq => {}
+                Effect::Branch(t) => {
+                    is_branch = true;
+                    if let Some(t) = t {
+                        next = t;
+                    }
+                }
+                Effect::Break => {
+                    m.set(REG_PC, epc);
+                    // The monitor reads the word at EPC, which for a delay
+                    // slot is the branch: not a `break`, so a hardware stop.
+                    return if branch.is_some() {
+                        Step::Hw { data: false }
+                    } else {
+                        Step::Break(insn)
+                    };
+                }
+                Effect::Watch => {
+                    m.set(REG_PC, epc);
+                    return Step::Hw { data: true };
+                }
+                Effect::Fault(code) => {
+                    m.set(REG_PC, epc);
+                    return Step::Fault(code);
+                }
+            }
+            m.set(0, 0);
+            branch = is_branch.then_some(pc);
+            pc = npc;
+            npc = next;
+        }
+        Step::Hang
     }
 }
 
