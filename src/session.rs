@@ -383,7 +383,7 @@ impl<T: Transport> Session<T> {
         {
             Some(f) if f.ty == REGS && f.ok => {
                 let mut regs = [0u32; NUM_REGS];
-                for (r, pair) in regs.iter_mut().zip(f.words.chunks_exact(2)) {
+                for (r, pair) in regs.iter_mut().zip(f.words.as_chunks::<2>().0) {
                     *r = word_u32(pair, 0);
                 }
                 Ok(regs)

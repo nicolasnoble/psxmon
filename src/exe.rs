@@ -200,7 +200,7 @@ fn elf_symbol(file: &[u8], sections: &[ElfSection], wanted: &str) -> Option<u32>
         let strtab = sections.get(usize::try_from(symtab.link).ok()?)?;
         let strings = file.get(strtab.offset..strtab.offset.saturating_add(strtab.size))?;
         let table = file.get(symtab.offset..symtab.offset.saturating_add(symtab.size))?;
-        for sym in table.chunks_exact(16) {
+        for sym in table.as_chunks::<16>().0 {
             let name = usize::try_from(rd32(sym, 0, "symbol").ok()?).ok()?;
             if c_string(strings, name) == wanted {
                 return rd32(sym, 4, "symbol").ok();
