@@ -10,6 +10,10 @@
 #   monitor-sio1-cart.rom           flash cartridge image, SIO1
 #   monitor-ft232h-<board>.ps-exe   PS-EXE, FT232H on the expansion port;
 #                                   boards in nugget monitor/hosts/ft232h-boards.mk
+#   openbios-sio1-cart.rom          OpenBIOS replacing the retail one from a
+#                                   flash cartridge, monitor on SIO1
+#   openbios-sio1.rom               OpenBIOS as the console's BIOS ROM, SIO1
+#   openbios-ft232h-<board>.rom     same, FT232H on the expansion port
 #   openbios-atcons-h2700.elf       OpenBIOS for the H2700 code cave; turn it
 #                                   into a flash image with psxmon patch-h2700
 # Disc images of the PS-EXEs come from psxmon mkdisc, in the release workflow.
@@ -43,8 +47,21 @@ for board in psx232h-a20 psx232h-a0 picodev-usb picodev-uart piodev-lite; do
 done
 clean
 
-make -C "$nugget/openbios" clean >/dev/null
-make -C "$nugget/openbios" -j"$jobs" BOOT=cart MONITOR=1
+openbios() {
+    make -C "$nugget/openbios" clean >/dev/null
+    make -C "$nugget/openbios" -j"$jobs" MONITOR=1 "$@"
+}
+
+openbios BOOT=cart MONITOR_LINK=SIO1
+cp "$nugget/openbios/openbios.bin" "$out/openbios-sio1-cart.rom"
+openbios BOOT=rom MONITOR_LINK=SIO1
+cp "$nugget/openbios/openbios.bin" "$out/openbios-sio1.rom"
+for board in psx232h-a20 psx232h-a0 picodev-usb picodev-uart piodev-lite; do
+    openbios BOOT=rom MONITOR_LINK=FT232H MONITOR_FT232H_BOARD="$board"
+    cp "$nugget/openbios/openbios.bin" "$out/openbios-ft232h-$board.rom"
+done
+
+openbios BOOT=cart
 cp "$nugget/openbios/openbios.elf" "$out/openbios-atcons-h2700.elf"
 make -C "$nugget/openbios" clean >/dev/null
 
