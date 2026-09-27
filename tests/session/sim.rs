@@ -1,6 +1,6 @@
 //! A fake monitor for tests: speaks the SIO1 byte-stream protocol the way
 //! monitor.c and transport.c do, over the in-memory transport, with 2 MiB of
-//! RAM, a register file, SET_BAUD with its two windows, and a scripted
+//! RAM (or 4 or 8) repeating over the 8 MiB RAM window, a register file, SET_BAUD with its two windows, and a scripted
 //! target program that prints, makes PCDRV breaks and exits, or an R3000
 //! subset interpreter with the cop0 debug unit (SET_BP / CLR_BP) and a ROM.
 
@@ -16,7 +16,14 @@ use psxmon::session::deadline_after;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::{Instant, timeout_at};
 
+/// Installed RAM by default.
 pub const RAM_SIZE: usize = 2 << 20;
+/// The physical RAM window the BIOS maps: installed RAM repeats over it.
+pub const RAM_WINDOW: usize = 8 << 20;
+/// Memory control RAM_SIZE register, and the value the BIOS leaves in it
+/// (the 8 MiB window).
+pub const RAM_SIZE_REG: u32 = 0x1f80_1060;
+pub const RAM_SIZE_BIOS: u32 = 0x0000_0b88;
 pub const RUN_SR: u32 = 0x4000_0404;
 const EXIT_BREAK: u32 = 0x0004_000d;
 
@@ -33,6 +40,8 @@ pub const FP: u16 = 30;
 
 /// Physical base of the BIOS ROM.
 pub const ROM_BASE: u32 = 0x1fc0_0000;
+/// PCSX-Redux's debug console port: a byte stored here is console text.
+pub const TTY_PORT: u32 = 0x1f80_2080;
 
 /// The cop0 debug unit as the monitor drives it (PROTOCOL.md section 11).
 #[derive(Default, Debug, Clone, Copy)]
@@ -54,13 +63,29 @@ pub struct Machine {
     pub rom: Vec<u8>,
     pub regs: [u32; NUM_REGS],
     pub dbg: DebugUnit,
+    /// Bytes stored to [`TTY_PORT`], sent as console text before the next
+    /// step's outcome.
+    pub tty: Vec<u8>,
+    /// The memory control RAM_SIZE register.
+    pub ram_size_reg: u32,
 }
 
 impl Machine {
-    fn phys(addr: u32) -> Option<usize> {
+    /// Offset in `ram` of a RAM address: any address in the 8 MiB window,
+    /// wrapped to the installed size.
+    fn phys(&self, addr: u32) -> Option<usize> {
         usize::try_from(addr & 0x1fff_ffff)
             .ok()
-            .filter(|&p| p < RAM_SIZE)
+            .filter(|&p| p < RAM_WINDOW)
+            .and_then(|p| p.checked_rem(self.ram.len()))
+    }
+
+    /// Byte `i` of the RAM_SIZE register, for an address on it.
+    fn reg_off(addr: u32) -> Option<usize> {
+        (addr & 0x1fff_ffff)
+            .checked_sub(RAM_SIZE_REG)
+            .and_then(|o| usize::try_from(o).ok())
+            .filter(|&o| o < 4)
     }
 
     fn rom_off(addr: u32) -> Option<usize> {
@@ -70,7 +95,10 @@ impl Machine {
     }
 
     fn byte(&self, at: u32) -> u8 {
-        Self::phys(at)
+        if let Some(i) = Self::reg_off(at) {
+            return self.ram_size_reg.to_le_bytes()[i];
+        }
+        self.phys(at)
             .and_then(|p| self.ram.get(p))
             .or_else(|| Self::rom_off(at).and_then(|o| self.rom.get(o)))
             .copied()
@@ -97,7 +125,11 @@ impl Machine {
     pub fn write(&mut self, addr: u32, data: &[u8]) {
         let mut at = addr;
         for &b in data {
-            if let Some(slot) = Self::phys(at).and_then(|p| self.ram.get_mut(p)) {
+            if let Some(i) = Self::reg_off(at) {
+                let mut r = self.ram_size_reg.to_le_bytes();
+                r[i] = b;
+                self.ram_size_reg = u32::from_le_bytes(r);
+            } else if let Some(slot) = self.phys(at).and_then(|p| self.ram.get_mut(p)) {
                 *slot = b;
             }
             at = at.wrapping_add(1);
@@ -158,6 +190,10 @@ pub struct SimConfig {
     pub start_rate: Option<u32>,
     /// BIOS ROM contents.
     pub rom: Vec<u8>,
+    /// Installed RAM in bytes, a divisor of the 8 MiB window.
+    pub ram_size: usize,
+    /// The RAM_SIZE register's value at start.
+    pub ram_size_reg: u32,
 }
 
 impl Default for SimConfig {
@@ -170,6 +206,8 @@ impl Default for SimConfig {
             unreachable_rate: false,
             start_rate: None,
             rom: Vec::new(),
+            ram_size: RAM_SIZE,
+            ram_size_reg: RAM_SIZE_BIOS,
         }
     }
 }
@@ -226,6 +264,7 @@ impl Sim {
             ..Default::default()
         }));
         let rom = cfg.rom.clone();
+        let (ram_size, ram_size_reg) = (cfg.ram_size, cfg.ram_size_reg);
         let sim = Sim {
             io,
             rx: VecDeque::new(),
@@ -233,10 +272,12 @@ impl Sim {
             host_rate,
             cfg,
             m: Machine {
-                ram: vec![0; RAM_SIZE],
+                ram: vec![0; ram_size],
                 rom,
                 regs: [0; NUM_REGS],
                 dbg: DebugUnit::default(),
+                tty: Vec::new(),
+                ram_size_reg,
             },
             ctx: false,
             epc: 0,
@@ -614,6 +655,10 @@ impl Sim {
             self.program.step(&mut self.m)
         };
         loop {
+            if !self.m.tty.is_empty() {
+                let text = std::mem::take(&mut self.m.tty);
+                self.put(&text).await;
+            }
             match step {
                 Step::Tty(bytes) => {
                     let bytes: Vec<u8> = bytes.into_iter().filter(|&b| b != 0).collect();
@@ -805,6 +850,9 @@ impl Interp {
                     0x29 => 2,
                     _ => 4,
                 };
+                if op == 0x28 && addr & 0x1fff_ffff == TTY_PORT {
+                    m.tty.push(rt.to_le_bytes()[0]);
+                }
                 m.write(addr, &rt.to_le_bytes()[..n]);
                 Effect::Seq
             }

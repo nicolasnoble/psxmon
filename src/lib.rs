@@ -13,9 +13,10 @@ pub mod lz4;
 pub mod mips;
 pub mod pcdrv;
 pub mod proto;
+pub mod ram;
 pub mod session;
 pub mod transport;
 
 pub use atcons::AtconsTransport;
 pub use session::{LoadOptions, RunResult, Session, SessionError, Stop};
-pub use transport::{MemTransport, SerialTransport, Transport};
+pub use transport::{MemTransport, SerialTransport, TcpTransport, Transport};

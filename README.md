@@ -30,8 +30,12 @@ binary is a thin command line on top of it.
     psxmon mkdisc <exe> -o FILE.bin [--license FILE] [--no-pad]
 
 `--port DEV` is the serial port the monitor is on (see below), or
-`PSXMON_PORT` when `--port` is left out. `--port atcons` (or `atcons:BASE`,
+`PSXMON_PORT` when `--port` is left out. `--port tcp:HOST:PORT` (or
+`tcp://HOST:PORT`) connects to the monitor's byte stream over TCP, for
+example PCSX-Redux's SIO1 server. `--port atcons` (or `atcons:BASE`,
 default base 0x1340) uses the DTL-H2700's ISA card instead; see below.
+TCP and ATCONS have no line rate: `--baud` is not used on them, and
+`--fast-reload` is an error.
 Addresses and lengths take decimal
 or `0x` hex.
 
@@ -79,7 +83,7 @@ or `0x` hex.
 
 `DEV` is the host end of the link: a USB serial adapter on the console's
 serial port for the SIO1 images, the FT232H's own serial port for an FT232H
-image (whose `--baud` is ignored), or a pty bridged to an emulator.
+image (whose `--baud` is ignored), or a TCP address.
 
     psxmon ping --port /dev/ttyUSB0              # Linux, USB adapter
     psxmon ping --port /dev/cu.usbserial-A10K1Y  # macOS
@@ -95,11 +99,12 @@ is used as is. On macOS use the `/dev/cu.*` node; `/dev/tty.*` waits for
 carrier detect. On Linux the user needs access to the
 device, usually through the `dialout` or `uucp` group.
 
-For PCSX-Redux, turn on its SIO1 server in raw mode, bridge that to a pty,
-and pass the pty:
+For PCSX-Redux, turn on its SIO1 server in raw mode and connect to it:
 
-    socat PTY,link=/tmp/psx,raw,echo=0 TCP:127.0.0.1:6699 &
-    psxmon run prog.ps-exe --port /tmp/psx
+    psxmon run prog.ps-exe --port tcp:127.0.0.1:6699
+
+The same form reaches a serial-to-TCP bridge (ser2net or similar) in raw
+mode; the bridge sets the line rate.
 
 ## DTL-H2700 (ATCONS)
 
@@ -143,7 +148,10 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   When the program exits (`break 4, 0`) gdb sees the process exit, and
   psxmon exits with the code as `run` does. gdb's `W` packet carries only
   the low 8 bits of the code; psxmon prints the full code on stderr.
-- Console text goes to psxmon's stdout. PCDRV calls are served from
+- Console text goes to psxmon's stdout, and while the target runs also to
+  gdb as `O` packets, which gdb prints as the program's output (with
+  `--batch`, on its stderr). Text printed while the target is halted
+  reaches gdb at the next `continue` or `step`. PCDRV calls are served from
   `--pcdrv` while the target runs, exactly as with `run`; gdb never sees
   them.
 - Software breakpoints are gdb's own: it writes `break` instructions into
@@ -156,7 +164,14 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   unit compares the address the CPU issues, so a word store that covers a
   watched byte at another address does not trigger it.
 - Breakpoints and the watch match an address in all three segments (the
-  compare mask leaves out bits 29-31). A hardware stop disarms the whole
+  compare mask leaves out bits 29-31), and in RAM every mirror of it: the
+  BIOS maps 8 MiB of addresses to RAM, over which 2 MiB repeats four
+  times and 4 MiB twice, so the mask also leaves out the bits between the
+  installed size and 8 MiB. psxmon finds the installed size the first time
+  it arms a breakpoint in RAM, by flipping the word at physical 0 and
+  reading it back 2, 4 and 6 MiB up (the word is put back), and skips
+  that when the program has shrunk the first DRAM bank below 8 MiB
+  (DRAM_CTRL at 0x1f801060), where nothing repeats. A hardware stop disarms the whole
   debug unit, so psxmon re-arms it with SET_BP before every CONT, and turns
   it off after every other stop so the monitor's own memory accesses cannot
   trip it.

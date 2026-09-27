@@ -48,6 +48,9 @@ fn ori(rt: u32, rs: u32, imm: u32) -> u32 {
 fn sw(rt: u32, off: i32, base: u32) -> u32 {
     itype(0x2b, base, rt, off)
 }
+fn sb(rt: u32, off: i32, base: u32) -> u32 {
+    itype(0x28, base, rt, off)
+}
 fn beq(rs: u32, rt: u32, words: i32) -> u32 {
     itype(4, rs, rt, words)
 }
@@ -89,6 +92,19 @@ fn main_program() -> Vec<u32> {
     ]
 }
 
+/// Prints `text` through the sim's tty port, then exits 42.
+fn print_program(text: &[u8]) -> Vec<u32> {
+    let mut w = vec![lui(T0, sim::TTY_PORT >> 16)];
+    let off = i32::try_from(sim::TTY_PORT & 0xffff).expect("16 bits");
+    for &b in text {
+        w.push(addiu(T1, ZERO, i32::from(b)));
+        w.push(sb(T1, off, T0));
+    }
+    w.push(addiu(A0, ZERO, 42));
+    w.push(brk(4, 0));
+    w
+}
+
 fn rom() -> Vec<u8> {
     let mut r = vec![0u8; 0x200];
     r[0x100..0x104].copy_from_slice(&JR_RA.to_le_bytes());
@@ -117,8 +133,14 @@ struct Rig {
 /// A sim running `words`, a MonTarget over it halted at the entry, and a
 /// server thread waiting for one gdb connection.
 fn rig(words: &[u32]) -> Rig {
+    rig_with(words, sim::RAM_SIZE)
+}
+
+/// [`rig`] with `ram` bytes of RAM installed.
+fn rig_with(words: &[u32], ram: usize) -> Rig {
     let cfg = SimConfig {
         rom: rom(),
+        ram_size: ram,
         ..Default::default()
     };
     // The sim gets a thread and runtime of its own; the server's runtime is
@@ -317,8 +339,9 @@ fn rsp_registers_memory_breakpoints_steps_pcdrv_exit() {
             "{:x?}",
             st.set_bps
         );
+        // 2 MiB installed: the mask leaves out bits 21-22, the mirrors.
         assert!(
-            st.set_bps.contains(&(2, DATA, 0x1fff_fffc)),
+            st.set_bps.contains(&(2, DATA, 0x1f9f_fffc)),
             "{:x?}",
             st.set_bps
         );
@@ -419,6 +442,107 @@ fn rsp_detach_leaves_target_halted() {
     assert_eq!(code, None);
     let st = rig.stats.lock().expect("stats");
     assert_eq!(st.cmds.last(), Some(&WRITE_MEM), "no CONT after detach");
+}
+
+/// Stores a word at 0x80200100, 2 MiB above 0x80000100, then exits 42.
+fn mirror_store_program() -> Vec<u32> {
+    vec![
+        lui(T0, 0x8020),
+        addiu(T1, ZERO, 7),
+        sw(T1, 0x100, T0), // 08
+        addiu(A0, ZERO, 42),
+        brk(4, 0),
+    ]
+}
+
+/// A watch on 0x80000100 fires on a store through its mirror 0x80200100
+/// when 2 MiB is installed, and not when 8 MiB is (no mirror there).
+#[test]
+fn rsp_watch_matches_ram_mirrors() {
+    let rig = rig_with(&mirror_store_program(), 2 << 20);
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    assert_eq!(g.cmd("Z2,80000100,4"), "OK");
+    let r = g.cmd("c");
+    assert!(r.starts_with("T05") && r.contains("watch:80000100"), "{r}");
+    assert_eq!(g.pc(), BASE + 0x08);
+    {
+        let st = rig.stats.lock().expect("stats");
+        assert!(
+            st.set_bps.contains(&(2, 0x8000_0100, 0x1f9f_fffc)),
+            "{:x?}",
+            st.set_bps
+        );
+    }
+    // The sentinel the probe flipped is back.
+    assert_eq!(g.cmd("ma0000000,4"), "00000000");
+    assert_eq!(g.cmd("D"), "OK");
+    rig.server.join().expect("server thread");
+
+    let rig = rig_with(&mirror_store_program(), 8 << 20);
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    assert_eq!(g.cmd("Z2,80000100,4"), "OK");
+    assert_eq!(g.cmd("c"), "W2a");
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
+    let st = rig.stats.lock().expect("stats");
+    assert!(
+        st.set_bps.contains(&(2, 0x8000_0100, 0x1fff_fffc)),
+        "{:x?}",
+        st.set_bps
+    );
+}
+
+/// Console text printed while the target runs reaches gdb as `O` packets
+/// before the stop reply.
+#[test]
+fn rsp_console_text_as_o_packets() {
+    let rig = rig(&print_program(b"hi\n"));
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    let mut got = String::new();
+    let mut r = g.cmd("c");
+    while let Some(hex) = r.strip_prefix('O') {
+        got.push_str(hex);
+        r = g.reply();
+    }
+    assert_eq!(got, "68690a", "O packets before the stop");
+    assert_eq!(r, "W2a");
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
+}
+
+/// gdb-multiarch shows the target's console text. Opt in: PSXMON_GDB_E2E=1.
+#[test]
+fn gdb_multiarch_shows_console_text() {
+    if std::env::var_os("PSXMON_GDB_E2E").is_none() {
+        eprintln!("skipped: set PSXMON_GDB_E2E=1 to run gdb-multiarch");
+        return;
+    }
+    let rig = rig(&print_program(b"target: hello\n"));
+    let target = format!("target remote 127.0.0.1:{}", rig.port);
+    let out = std::process::Command::new("gdb-multiarch")
+        .args(["--batch", "-nx"])
+        .args(["-ex", "set architecture mips:3000"])
+        .args(["-ex", "set endian little"])
+        .args(["-ex", &target])
+        .args(["-ex", "continue"])
+        .output()
+        .expect("run gdb-multiarch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // gdb --batch writes the target's output to its stderr.
+    assert!(
+        format!("{stdout}{stderr}").contains("target: hello"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("exited with code 052"),
+        "{stdout}\n{stderr}"
+    );
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
 }
 
 /// gdb-multiarch against the sim-backed server. Opt in: PSXMON_GDB_E2E=1.

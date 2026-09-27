@@ -17,6 +17,7 @@ use crate::frame::{
 use crate::lz4::{self, DecodeError};
 use crate::pcdrv::PcdrvServer;
 use crate::proto::{self, *};
+use crate::ram;
 use crate::transport::Transport;
 
 /// Longest PCDRV file name read out of target memory.
@@ -172,6 +173,8 @@ pub struct Session<T: Transport> {
     pub hw: HwBreaks,
     /// Whether the monitor's debug unit may be armed right now.
     hw_live: bool,
+    /// What [`Session::probe_ram`] found, once it has run.
+    ram_size: Option<u32>,
 }
 
 impl<T: Transport> Session<T> {
@@ -188,6 +191,7 @@ impl<T: Transport> Session<T> {
             verbose: false,
             hw: HwBreaks::default(),
             hw_live: false,
+            ram_size: None,
         }
     }
 
@@ -203,6 +207,11 @@ impl<T: Transport> Session<T> {
         {
             sink(&std::mem::take(&mut self.text));
         }
+    }
+
+    /// Remove the console sink, so text is buffered again; returns it.
+    pub fn take_console(&mut self) -> Option<Console> {
+        self.console.take()
     }
 
     /// Console text buffered since the last call.
@@ -454,12 +463,87 @@ impl<T: Transport> Session<T> {
     /// SET_BP everything in [`Session::hw`]. The unit is off here (a
     /// hardware stop cleared it, any other stop was followed by
     /// [`Session::disarm`]), so SET_BP's OR into DCIC starts from zero.
+    /// A breakpoint in RAM is widened to every mirror of its address
+    /// ([`ram::mirror_mask`]), which the first such one probes for.
     async fn arm(&mut self) -> Result<()> {
-        for bp in [self.hw.exec, self.hw.data].into_iter().flatten() {
+        let bps = [self.hw.exec, self.hw.data];
+        let installed = if bps.iter().flatten().any(|b| ram::in_ram_window(b.addr)) {
+            self.probe_ram().await?
+        } else {
+            ram::RAM_WINDOW
+        };
+        for bp in bps.into_iter().flatten() {
             self.hw_live = true;
-            self.set_bp(bp).await?;
+            self.set_bp(HwBreak {
+                mask: ram::mirror_mask(bp.addr, bp.mask, installed),
+                ..bp
+            })
+            .await?;
         }
         Ok(())
+    }
+
+    /// The RAM that repeats over the 8 MiB window: 2, 4 or 8 MiB, probed
+    /// the first time and remembered for the session (see [`ram`]). The
+    /// target must be halted. When the first DRAM bank does not span the
+    /// window (a program shrank it), nothing repeats and this is 8 MiB
+    /// without probing.
+    pub async fn probe_ram(&mut self) -> Result<u32> {
+        if let Some(n) = self.ram_size {
+            return Ok(n);
+        }
+        let n = self.probe_ram_uncached().await?;
+        if self.verbose {
+            eprintln!(
+                "psxmon: {} MiB of RAM repeats over the 8 MiB window",
+                n / ram::MIB
+            );
+        }
+        self.ram_size = Some(n);
+        Ok(n)
+    }
+
+    async fn probe_ram_uncached(&mut self) -> Result<u32> {
+        let ctrl = self.read_u32(ram::RAM_SIZE_REG).await?;
+        if !ram::window_mirrors(ctrl) {
+            if self.verbose {
+                eprintln!("psxmon: DRAM_CTRL 0x{ctrl:08x}: no 8 MiB bank, no RAM mirrors");
+            }
+            return Ok(ram::RAM_WINDOW);
+        }
+        let at = |off: u32| ram::SENTINEL.wrapping_add(off);
+        let v = self.read_u32(ram::SENTINEL).await?;
+        let mut mirror = [false; 3];
+        for (m, &off) in mirror.iter_mut().zip(ram::PROBE_OFFSETS.iter()) {
+            *m = self.read_u32(at(off)).await? == v;
+        }
+        if mirror.contains(&true) {
+            // Equal words may be chance: flip the sentinel, see which follow.
+            self.write_mem(ram::SENTINEL, &(!v).to_le_bytes()).await?;
+            let mut seen = Ok(());
+            for (m, &off) in mirror.iter_mut().zip(ram::PROBE_OFFSETS.iter()) {
+                if *m {
+                    match self.read_u32(at(off)).await {
+                        Ok(w) => *m = w == !v,
+                        Err(e) => {
+                            seen = Err(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            let restored = self.write_mem(ram::SENTINEL, &v.to_le_bytes()).await;
+            seen?;
+            restored?;
+        }
+        Ok(ram::size_from_mirrors(mirror))
+    }
+
+    async fn read_u32(&mut self, addr: u32) -> Result<u32> {
+        let b = self.read_mem(addr, 4).await?;
+        b.first_chunk::<4>()
+            .map(|w| u32::from_le_bytes(*w))
+            .ok_or_else(|| SessionError::Other(format!("short READ_MEM at 0x{addr:08x}")))
     }
 
     /// Turn the debug unit off while halted, so that the monitor's own

@@ -1,5 +1,5 @@
-//! Byte links a session runs over: a serial port, or an in-memory pipe for
-//! tests.
+//! Byte links a session runs over: a serial port, a TCP connection, or an
+//! in-memory pipe for tests.
 
 use std::io;
 use std::pin::Pin;
@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serialport::SerialPort;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 /// An async byte link with a settable line rate.
@@ -290,6 +291,70 @@ impl AsyncWrite for SerialTransport {
     }
 }
 
+/// The `HOST:PORT` of a `--port` that names a TCP link: `tcp:HOST:PORT` or
+/// `tcp://HOST:PORT`. None for any other port.
+pub fn parse_tcp_port(port: &str) -> Option<&str> {
+    port.strip_prefix("tcp://")
+        .or_else(|| port.strip_prefix("tcp:"))
+}
+
+/// A TCP connection to something that bridges to the monitor's byte stream:
+/// PCSX-Redux's SIO1 server, or a serial-to-TCP bridge. The line rate is the
+/// far end's business, so there is none here.
+pub struct TcpTransport {
+    io: TcpStream,
+}
+
+impl TcpTransport {
+    /// Connect to `addr` (`HOST:PORT`; an IPv6 host in brackets).
+    pub async fn connect(addr: &str) -> io::Result<Self> {
+        let io = TcpStream::connect(addr).await?;
+        // Frames are small and each waits for its reply.
+        io.set_nodelay(true)?;
+        Ok(TcpTransport { io })
+    }
+}
+
+impl Transport for TcpTransport {
+    fn set_baud_rate(&mut self, _baud: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a TCP link has no line rate",
+        ))
+    }
+
+    /// 0: the link has no line rate.
+    fn baud_rate(&self) -> u32 {
+        0
+    }
+}
+
+impl AsyncRead for TcpTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
 /// One end of an in-memory byte pipe. The host end's line rate is shared
 /// with whoever holds the other end (a simulator can garble bytes when the
 /// two sides disagree on it).
@@ -351,7 +416,8 @@ impl AsyncWrite for MemTransport {
     }
 }
 
-/// Any transport, chosen at run time (a serial port or the ATCONS card).
+/// Any transport, chosen at run time (a serial port, TCP, or the ATCONS
+/// card).
 impl<T: Transport + ?Sized> Transport for Box<T> {
     fn set_baud_rate(&mut self, baud: u32) -> io::Result<()> {
         (**self).set_baud_rate(baud)
@@ -371,7 +437,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
 
-    use super::{POLL, SerialTransport, Transport};
+    use super::{POLL, SerialTransport, TcpTransport, Transport, parse_tcp_port};
 
     /// A read abandoned at its deadline leaves the link usable: the next
     /// read gets the bytes, writes still go out, and so does a rate change.
@@ -410,5 +476,42 @@ mod tests {
             .expect("read after second timeout")
             .expect("read");
         assert_eq!(&got, b"again");
+    }
+
+    #[test]
+    fn tcp_port_forms() {
+        assert_eq!(parse_tcp_port("tcp:127.0.0.1:6699"), Some("127.0.0.1:6699"));
+        assert_eq!(parse_tcp_port("tcp://host:1"), Some("host:1"));
+        assert_eq!(parse_tcp_port("tcp:[::1]:6699"), Some("[::1]:6699"));
+        assert_eq!(parse_tcp_port("/dev/ttyUSB0"), None);
+        assert_eq!(parse_tcp_port("atcons"), None);
+    }
+
+    /// Bytes go both ways over TCP, and a rate change is refused.
+    #[tokio::test]
+    async fn tcp_round_trip_and_no_rate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let far = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut got = [0u8; 4];
+            sock.read_exact(&mut got).await.expect("far read");
+            sock.write_all(b"pong").await.expect("far write");
+            got
+        });
+        let mut link = TcpTransport::connect(&addr).await.expect("connect");
+        assert_eq!(link.baud_rate(), 0);
+        assert!(link.set_baud_rate(115_200).is_err());
+        link.write_all(b"ping").await.expect("write");
+        link.flush().await.expect("flush");
+        let mut got = [0u8; 4];
+        timeout(Duration::from_secs(2), link.read_exact(&mut got))
+            .await
+            .expect("reply in time")
+            .expect("read");
+        assert_eq!(&got, b"pong");
+        assert_eq!(&far.await.expect("far"), b"ping");
     }
 }

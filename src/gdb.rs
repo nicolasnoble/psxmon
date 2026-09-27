@@ -27,8 +27,15 @@
 //!   a stop on the wire is dropped by the halted monitor. A target that
 //!   takes no interrupts cannot be stopped this way, and neither can one
 //!   under a monitor without `CAP_STOP`: there the interrupt is ignored.
+//! - Console text the target prints while it runs goes to gdb as `O`
+//!   packets (gdb shows it as the program's output), and still to whatever
+//!   sink the session had (stdout for `psxmon gdb`). gdbstub 0.7 only
+//!   writes `O` inside a `monitor` command, so the event loop writes them
+//!   itself while it waits for a stop, the one time RSP allows them. Text
+//!   that arrives while the target is halted is held for the next resume.
 
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gdbstub::common::Signal;
@@ -72,6 +79,10 @@ const POLL: Duration = Duration::from_millis(50);
 const START_WAIT: Duration = Duration::from_secs(5);
 /// How long after a STOP with no stop it is sent again.
 const STOP_RESEND: Duration = Duration::from_secs(1);
+/// Console bytes per `O` packet (twice that in hex on the wire).
+const O_CHUNK: usize = 512;
+/// Most console text held for gdb; past it, newer text is dropped.
+const O_HELD_MAX: usize = 64 << 10;
 
 /// `break 0x3ff, 0`: the word psxmon plants for a single step and at a
 /// program's entry. Any other `break` is the program's or gdb's.
@@ -140,12 +151,26 @@ pub struct MonTarget<T: Transport> {
     pub exit_code: Option<u32>,
     /// Log stops, steps and breakpoint changes to stderr.
     pub verbose: bool,
+    /// Console text not yet sent to gdb.
+    gdb_text: Arc<Mutex<Vec<u8>>>,
 }
 
 impl<T: Transport> MonTarget<T> {
     /// A target over an attached session. `rt` runs the session's I/O and
-    /// must not be the runtime the caller is inside of.
-    pub fn new(rt: Runtime, sess: Session<T>, pcdrv: Option<PcdrvServer>) -> Self {
+    /// must not be the runtime the caller is inside of. The session's
+    /// console sink keeps getting the target's text; gdb gets a copy.
+    pub fn new(rt: Runtime, mut sess: Session<T>, pcdrv: Option<PcdrvServer>) -> Self {
+        let gdb_text = Arc::new(Mutex::new(Vec::new()));
+        let held = gdb_text.clone();
+        let mut sink = sess.take_console();
+        sess.set_console(Some(Box::new(move |bytes: &[u8]| {
+            if let Some(sink) = sink.as_mut() {
+                sink(bytes);
+            }
+            let mut held = held.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = O_HELD_MAX.saturating_sub(held.len());
+            held.extend_from_slice(bytes.get(..room.min(bytes.len())).unwrap_or_default());
+        })));
         MonTarget {
             rt,
             sess,
@@ -157,7 +182,13 @@ impl<T: Transport> MonTarget<T> {
             stop_sent: None,
             exit_code: None,
             verbose: false,
+            gdb_text,
         }
+    }
+
+    /// Console text held for gdb, taken.
+    fn take_gdb_text(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.gdb_text.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     pub fn session(&mut self) -> &mut Session<T> {
@@ -231,8 +262,13 @@ impl<T: Transport> MonTarget<T> {
     /// Serve one gdb connection until gdb detaches, kills, or the target
     /// exits. The target is left halted in every case.
     pub fn serve(&mut self, conn: TcpStream) -> Res<DisconnectReason> {
+        let linger = conn.try_clone().ok();
         let gdb = GdbStub::new(conn);
-        match gdb.run_blocking::<EventLoop<T>>(self) {
+        let r = gdb.run_blocking::<EventLoop<T>>(self);
+        if let Some(sock) = linger {
+            close_gently(&sock);
+        }
+        match r {
             Ok(reason) => Ok(reason),
             Err(e) => {
                 if let Some(code) = self.exit_code {
@@ -815,6 +851,62 @@ impl<T: Transport> MemoryMap for MonTarget<T> {
     }
 }
 
+/// Close the gdb link without a reset: a socket closed with unread input
+/// (gdb's `+` for the last `O` packets, when the stop came in the same
+/// wait) sends RST, and gdb can then lose the stop reply still in its
+/// buffer. Send FIN, read until gdb closes or a short while passes.
+fn close_gently(sock: &TcpStream) {
+    use std::io::Read;
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+    let until = Instant::now().checked_add(Duration::from_millis(500));
+    let mut buf = [0u8; 256];
+    let mut r: &TcpStream = sock;
+    while until.is_some_and(|t| Instant::now() < t) {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `text` as RSP `O` packets (`$O<hex>#<sum>`), [`O_CHUNK`] bytes each.
+fn console_packets(text: &[u8]) -> Vec<Vec<u8>> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    text.chunks(O_CHUNK)
+        .map(|chunk| {
+            let mut body = Vec::with_capacity(chunk.len().saturating_mul(2).saturating_add(1));
+            body.push(b'O');
+            for &b in chunk {
+                body.push(HEX[usize::from(b >> 4)]);
+                body.push(HEX[usize::from(b & 15)]);
+            }
+            let sum = body.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+            let mut pkt = Vec::with_capacity(body.len().saturating_add(4));
+            pkt.push(b'$');
+            pkt.extend_from_slice(&body);
+            pkt.push(b'#');
+            pkt.push(HEX[usize::from(sum >> 4)]);
+            pkt.push(HEX[usize::from(sum & 15)]);
+            pkt
+        })
+        .collect()
+}
+
+/// Send gdb the console text held so far. Only while the target runs: an
+/// `O` packet is legal between a resume and its stop reply. gdb acks each
+/// with `+` (outside no-ack mode), which gdbstub reads and ignores.
+fn send_console<T: Transport>(target: &MonTarget<T>, conn: &mut TcpStream) -> std::io::Result<()> {
+    let text = target.take_gdb_text();
+    if text.is_empty() {
+        return Ok(());
+    }
+    for pkt in console_packets(&text) {
+        conn.write_all(&pkt)?;
+    }
+    Connection::flush(conn)
+}
+
 enum EventLoop<T> {
     #[allow(dead_code)]
     Never(std::marker::PhantomData<T>),
@@ -841,7 +933,10 @@ impl<T: Transport> BlockingEventLoop for EventLoop<T> {
                 let byte = conn.read().map_err(WaitForStopReasonError::Connection)?;
                 return Ok(Event::IncomingData(byte));
             }
-            if let Some(reason) = target.poll().map_err(WaitForStopReasonError::Target)? {
+            let stopped = target.poll().map_err(WaitForStopReasonError::Target)?;
+            // Text printed before the stop goes out before the stop reply.
+            send_console(target, conn).map_err(WaitForStopReasonError::Connection)?;
+            if let Some(reason) = stopped {
                 return Ok(Event::TargetStopped(reason));
             }
         }
@@ -852,5 +947,24 @@ impl<T: Transport> BlockingEventLoop for EventLoop<T> {
     fn on_interrupt(target: &mut MonTarget<T>) -> Result<Option<Self::StopReason>, SessionError> {
         target.interrupt()?;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{O_CHUNK, console_packets};
+
+    #[test]
+    fn console_text_becomes_o_packets() {
+        let pkts = console_packets(b"hi\n");
+        // 'O' + "68690a", checksum mod 256.
+        let body = b"O68690a";
+        let sum = body.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(pkts, vec![format!("$O68690a#{sum:02x}").into_bytes()]);
+        assert!(console_packets(b"").is_empty());
+        let long = vec![b'x'; O_CHUNK + 1];
+        let pkts = console_packets(&long);
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(pkts[1].len(), "$O78#00".len());
     }
 }
