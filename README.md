@@ -100,9 +100,9 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   debug unit, so psxmon re-arms it with SET_BP before every CONT, and turns
   it off after every other stop so the monitor's own memory accesses cannot
   trip it.
-- Single step: gdb steps MIPS by itself, planting a `break` at the next
-  instruction. For clients that send `s` / `vCont;s`, psxmon steps on the
-  host: it decodes the instruction at PC (branches and jumps with their
+- Single step: the target description says `<osabi>none</osabi>`, so gdb
+  sends `vCont;s` rather than stepping with breakpoints of its own. psxmon
+  steps on the host: it decodes the instruction at PC (branches and jumps with their
   delay slot), plants `break 0x3ff, 0` at the successor in RAM, or lends
   the exec breakpoint to a successor in ROM, continues, and restores
   everything at the stop.

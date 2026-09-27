@@ -43,6 +43,9 @@ use gdbstub::target::ext::breakpoints::{
     WatchKind,
 };
 use gdbstub::target::ext::memory_map::{MemoryMap, MemoryMapOps};
+use gdbstub::target::ext::target_description_xml_override::{
+    TargetDescriptionXmlOverride, TargetDescriptionXmlOverrideOps,
+};
 use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub_arch::mips::reg::MipsCoreRegs;
 use gdbstub_arch::mips::reg::id::MipsRegId;
@@ -466,6 +469,12 @@ impl<T: Transport> Target for MonTarget<T> {
         Some(self)
     }
 
+    fn support_target_description_xml_override(
+        &mut self,
+    ) -> Option<TargetDescriptionXmlOverrideOps<'_, Self>> {
+        Some(self)
+    }
+
     /// No Z0: gdb inserts its own `break` instructions through memory
     /// writes, and the stop comes back as SIGTRAP with the PC on them.
     fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
@@ -725,6 +734,40 @@ impl<T: Transport> HwWatchpoint for MonTarget<T> {
     }
 }
 
+/// Copy `offset..offset + length` of `bytes` into `buf`, for the qXfer reads.
+fn xfer(bytes: &[u8], offset: u64, length: usize, buf: &mut [u8]) -> usize {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let src = bytes.get(start..).unwrap_or_default();
+    let n = src.len().min(length).min(buf.len());
+    for (d, s) in buf.iter_mut().zip(src.iter().take(n)) {
+        *d = *s;
+    }
+    n
+}
+
+/// gdbstub_arch's MIPS description names no OS ABI, and gdb-multiarch then
+/// picks GNU/Linux, whose MIPS support single-steps in software: it plants
+/// its own `break` and sends `vCont;c`. With `none`, gdb sends `vCont;s`.
+const TARGET_XML: &str =
+    r#"<target version="1.0"><architecture>mips:3000</architecture><osabi>none</osabi></target>"#;
+
+impl<T: Transport> TargetDescriptionXmlOverride for MonTarget<T> {
+    fn target_description_xml(
+        &self,
+        annex: &[u8],
+        offset: u64,
+        length: usize,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        if annex != b"target.xml" {
+            return Err(TargetError::NonFatal);
+        }
+        Ok(xfer(TARGET_XML.as_bytes(), offset, length, buf))
+    }
+}
+
 impl<T: Transport> MemoryMap for MonTarget<T> {
     fn memory_map_xml(
         &self,
@@ -732,17 +775,7 @@ impl<T: Transport> MemoryMap for MonTarget<T> {
         length: usize,
         buf: &mut [u8],
     ) -> TargetResult<usize, Self> {
-        let xml = mips::memory_map_xml();
-        let bytes = xml.as_bytes();
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        let src = bytes.get(start..).unwrap_or_default();
-        let n = src.len().min(length).min(buf.len());
-        for (d, s) in buf.iter_mut().zip(src.iter().take(n)) {
-            *d = *s;
-        }
-        Ok(n)
+        Ok(xfer(mips::memory_map_xml().as_bytes(), offset, length, buf))
     }
 }
 
