@@ -48,6 +48,9 @@ fn ori(rt: u32, rs: u32, imm: u32) -> u32 {
 fn sw(rt: u32, off: i32, base: u32) -> u32 {
     itype(0x2b, base, rt, off)
 }
+fn sb(rt: u32, off: i32, base: u32) -> u32 {
+    itype(0x28, base, rt, off)
+}
 fn beq(rs: u32, rt: u32, words: i32) -> u32 {
     itype(4, rs, rt, words)
 }
@@ -87,6 +90,19 @@ fn main_program() -> Vec<u32> {
         addiu(A0, ZERO, 42),          // 38
         brk(4, 0),                    // 3c exit 42
     ]
+}
+
+/// Prints `text` through the sim's tty port, then exits 42.
+fn print_program(text: &[u8]) -> Vec<u32> {
+    let mut w = vec![lui(T0, sim::TTY_PORT >> 16)];
+    let off = i32::try_from(sim::TTY_PORT & 0xffff).expect("16 bits");
+    for &b in text {
+        w.push(addiu(T1, ZERO, i32::from(b)));
+        w.push(sb(T1, off, T0));
+    }
+    w.push(addiu(A0, ZERO, 42));
+    w.push(brk(4, 0));
+    w
 }
 
 fn rom() -> Vec<u8> {
@@ -419,6 +435,57 @@ fn rsp_detach_leaves_target_halted() {
     assert_eq!(code, None);
     let st = rig.stats.lock().expect("stats");
     assert_eq!(st.cmds.last(), Some(&WRITE_MEM), "no CONT after detach");
+}
+
+/// Console text printed while the target runs reaches gdb as `O` packets
+/// before the stop reply.
+#[test]
+fn rsp_console_text_as_o_packets() {
+    let rig = rig(&print_program(b"hi\n"));
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    let mut got = String::new();
+    let mut r = g.cmd("c");
+    while let Some(hex) = r.strip_prefix('O') {
+        got.push_str(hex);
+        r = g.reply();
+    }
+    assert_eq!(got, "68690a", "O packets before the stop");
+    assert_eq!(r, "W2a");
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
+}
+
+/// gdb-multiarch shows the target's console text. Opt in: PSXMON_GDB_E2E=1.
+#[test]
+fn gdb_multiarch_shows_console_text() {
+    if std::env::var_os("PSXMON_GDB_E2E").is_none() {
+        eprintln!("skipped: set PSXMON_GDB_E2E=1 to run gdb-multiarch");
+        return;
+    }
+    let rig = rig(&print_program(b"target: hello\n"));
+    let target = format!("target remote 127.0.0.1:{}", rig.port);
+    let out = std::process::Command::new("gdb-multiarch")
+        .args(["--batch", "-nx"])
+        .args(["-ex", "set architecture mips:3000"])
+        .args(["-ex", "set endian little"])
+        .args(["-ex", &target])
+        .args(["-ex", "continue"])
+        .output()
+        .expect("run gdb-multiarch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // gdb --batch writes the target's output to its stderr.
+    assert!(
+        format!("{stdout}{stderr}").contains("target: hello"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("exited with code 052"),
+        "{stdout}\n{stderr}"
+    );
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
 }
 
 /// gdb-multiarch against the sim-backed server. Opt in: PSXMON_GDB_E2E=1.

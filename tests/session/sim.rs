@@ -33,6 +33,8 @@ pub const FP: u16 = 30;
 
 /// Physical base of the BIOS ROM.
 pub const ROM_BASE: u32 = 0x1fc0_0000;
+/// PCSX-Redux's debug console port: a byte stored here is console text.
+pub const TTY_PORT: u32 = 0x1f80_2080;
 
 /// The cop0 debug unit as the monitor drives it (PROTOCOL.md section 11).
 #[derive(Default, Debug, Clone, Copy)]
@@ -54,6 +56,9 @@ pub struct Machine {
     pub rom: Vec<u8>,
     pub regs: [u32; NUM_REGS],
     pub dbg: DebugUnit,
+    /// Bytes stored to [`TTY_PORT`], sent as console text before the next
+    /// step's outcome.
+    pub tty: Vec<u8>,
 }
 
 impl Machine {
@@ -237,6 +242,7 @@ impl Sim {
                 rom,
                 regs: [0; NUM_REGS],
                 dbg: DebugUnit::default(),
+                tty: Vec::new(),
             },
             ctx: false,
             epc: 0,
@@ -614,6 +620,10 @@ impl Sim {
             self.program.step(&mut self.m)
         };
         loop {
+            if !self.m.tty.is_empty() {
+                let text = std::mem::take(&mut self.m.tty);
+                self.put(&text).await;
+            }
             match step {
                 Step::Tty(bytes) => {
                     let bytes: Vec<u8> = bytes.into_iter().filter(|&b| b != 0).collect();
@@ -805,6 +815,9 @@ impl Interp {
                     0x29 => 2,
                     _ => 4,
                 };
+                if op == 0x28 && addr & 0x1fff_ffff == TTY_PORT {
+                    m.tty.push(rt.to_le_bytes()[0]);
+                }
                 m.write(addr, &rt.to_le_bytes()[..n]);
                 Effect::Seq
             }

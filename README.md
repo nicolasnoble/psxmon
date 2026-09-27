@@ -147,7 +147,10 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   When the program exits (`break 4, 0`) gdb sees the process exit, and
   psxmon exits with the code as `run` does. gdb's `W` packet carries only
   the low 8 bits of the code; psxmon prints the full code on stderr.
-- Console text goes to psxmon's stdout. PCDRV calls are served from
+- Console text goes to psxmon's stdout, and while the target runs also to
+  gdb as `O` packets, which gdb prints as the program's output (with
+  `--batch`, on its stderr). Text printed while the target is halted
+  reaches gdb at the next `continue` or `step`. PCDRV calls are served from
   `--pcdrv` while the target runs, exactly as with `run`; gdb never sees
   them.
 - Software breakpoints are gdb's own. psxmon does not offer `Z0`, so gdb

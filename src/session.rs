@@ -205,6 +205,11 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// Remove the console sink, so text is buffered again; returns it.
+    pub fn take_console(&mut self) -> Option<Console> {
+        self.console.take()
+    }
+
     /// Console text buffered since the last call.
     pub fn take_text(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.text)
