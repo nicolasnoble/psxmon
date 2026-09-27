@@ -18,6 +18,7 @@ binary is a thin command line on top of it.
     psxmon dump <addr> <len> -o FILE --port DEV
     psxmon write <addr> <file> --port DEV
     psxmon patch-h2700 <stock> <monitor> -o FILE
+    psxmon mkdisc <exe> -o FILE.bin [--license FILE] [--no-pad]
 
 `--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
 or `0x` hex.
@@ -49,6 +50,11 @@ or `0x` hex.
   its hook. It refuses anything that is not an unpatched H2700 flash. With
   the reset-mode switch at 7 the cart boots the monitor; any other mode
   boots the stock BIOS.
+- `mkdisc` builds a bootable disc image with the PS-EXE as `PSX.EXE`: a
+  Mode 2 `.bin` identical to PCSX-Redux's `exe2iso`, and a `.cue` beside it.
+  Sectors 0-15 hold `--license` (an SDK file in 2336-byte sectors or a raw
+  image), or zeros without it. `--no-pad` leaves out the 150 blank sectors
+  after the volume.
 
 ## Exit status
 

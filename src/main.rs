@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use psxmon::pcdrv::{PcdrvServer, Quota};
 use psxmon::proto::{self, CAP_LZ4, STOP_EXIT};
 use psxmon::session::{LoadOptions, Session};
-use psxmon::{SerialTransport, bios, exe, h2700, lz4};
+use psxmon::{SerialTransport, bios, exe, h2700, iso, lz4};
 
 /// Largest target exit code passed through as the process exit status;
 /// anything above it (or negative) exits with this value.
@@ -112,6 +112,21 @@ enum Cmd {
         monitor: PathBuf,
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
+    },
+    /// Build a bootable disc image from EXE, a PS-EXE, as PSX.EXE: the same
+    /// `.bin` as PCSX-Redux's exe2iso, plus a `.cue` next to it.
+    Mkdisc {
+        exe: PathBuf,
+        /// The `.bin` to write; the `.cue` gets the same name.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+        /// License for sectors 0-15: an SDK file (2336-byte sectors) or the
+        /// start of a raw 2352-byte image. Without it they are zeroed.
+        #[arg(long, value_name = "FILE")]
+        license: Option<PathBuf>,
+        /// Leave out the 150 blank sectors after the end of the volume.
+        #[arg(long)]
+        no_pad: bool,
     },
 }
 
@@ -316,6 +331,31 @@ fn patch_h2700(stock: &Path, monitor: &Path, output: &Path) -> Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
+fn mkdisc(exe_path: &Path, output: &Path, license: Option<&Path>, pad: bool) -> Result<ExitCode> {
+    let exe = std::fs::read(exe_path).with_context(|| format!("reading {}", exe_path.display()))?;
+    let lic = license
+        .map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display())))
+        .transpose()?;
+    let bin =
+        iso::build(&exe, lic.as_deref(), pad).with_context(|| exe_path.display().to_string())?;
+    let bin_name = output
+        .file_name()
+        .with_context(|| format!("{} has no file name", output.display()))?
+        .to_string_lossy();
+    let cue_path = output.with_extension("cue");
+    let cue = format!("FILE \"{bin_name}\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
+    std::fs::write(output, &bin).with_context(|| format!("writing {}", output.display()))?;
+    std::fs::write(&cue_path, cue).with_context(|| format!("writing {}", cue_path.display()))?;
+    eprintln!(
+        "psxmon: {}: {} sectors, PSX.EXE {} bytes, cue {}",
+        output.display(),
+        bin.len() / iso::SECTOR_RAW,
+        exe.len(),
+        cue_path.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The process exit status for a target exit code: the code itself when it
 /// is 0..=123, else 123, so it never reads as one of psxmon's own statuses.
 fn exit_status(code: u32) -> u8 {
@@ -343,6 +383,12 @@ async fn main() -> ExitCode {
             monitor,
             output,
         } => patch_h2700(&stock, &monitor, &output),
+        Cmd::Mkdisc {
+            exe,
+            output,
+            license,
+            no_pad,
+        } => mkdisc(&exe, &output, license.as_deref(), !no_pad),
     };
     result.unwrap_or_else(|e| {
         eprintln!("psxmon: {e:#}");
