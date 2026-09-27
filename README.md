@@ -2,9 +2,10 @@
 
 Host tool for the PS1 debug monitor (`monitor/` in PCSX-Redux, wire protocol
 version 2, described in `monitor/PROTOCOL.md`). It talks to the monitor over
-SIO1 through a serial port. With it you can upload and run a program, stream
-the program's console text, serve its PCDRV file I/O from a host directory,
-and read or write target memory.
+SIO1 through a serial port, or over the DTL-H2700's ISA card (ATCONS). With
+it you can upload and run a program, stream the program's console text,
+serve its PCDRV file I/O from a host directory, and read or write target
+memory.
 
 A library (`psxmon`) holds the protocol and the session logic. The `psxmon`
 binary is a thin command line on top of it.
@@ -19,10 +20,14 @@ binary is a thin command line on top of it.
     psxmon ping --port DEV [--baud 115200]
     psxmon dump <addr> <len> -o FILE --port DEV
     psxmon write <addr> <file> --port DEV
+    psxmon h2700-reset [--mode 7] [--port atcons[:BASE]] [--no-connect]
+                       [--console SECS]
     psxmon patch-h2700 <stock> <monitor> -o FILE
     psxmon mkdisc <exe> -o FILE.bin [--license FILE] [--no-pad]
 
-`--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
+`--port` may also come from `PSXMON_PORT`. `--port atcons` (or
+`atcons:BASE`, default base 0x1340) uses the DTL-H2700's ISA card instead of
+a serial port; see below. Addresses and lengths take decimal
 or `0x` hex.
 
 - `run` loads a program, starts it, and copies its console text to stdout.
@@ -64,7 +69,27 @@ or `0x` hex.
   image), or zeros without it. `--no-pad` leaves out the 150 blank sectors
   after the volume.
 
-## Debugging with gdb
+## DTL-H2700 (ATCONS)
+
+On the DTL-H2700 the monitor runs from the code cave of the cart's flash
+(`patch-h2700`) and talks over the ISA card's two channels: frames on the
+16-bit word channel, the OpenBIOS console on the byte channel. psxmon drives
+the card with port I/O, so this needs x86 Linux and root (or
+`CAP_SYS_RAWIO` on the binary: `setcap cap_sys_rawio+ep psxmon`). On other
+systems `--port atcons` fails with an error.
+
+    sudo psxmon h2700-reset
+    sudo psxmon run prog.cpe --port atcons --pcdrv ./pc
+
+- `h2700-reset` resets the PS1 into `--mode` (7, the default, boots the
+  monitor; other modes the stock BIOS), then opens the card's host side the
+  way the SDK tools connect. In mode 7 it copies the boot's console text to
+  stdout until the monitor's HELLO, and prints the HELLO.
+- Attaching reads a HELLO still waiting in the word channel, then PINGs.
+- There is no line rate (`--baud` is ignored, `--fast-reload` is an error)
+  and no STOP: a running program stops only on its own.
+- psxmon polls the card from a thread and spins while data moves, so a
+  transfer keeps one CPU busy.
 
 `psxmon gdb` is a GDB remote server (RSP over TCP) on top of the monitor.
 Use it with `gdb-multiarch` or any `mips` gdb:

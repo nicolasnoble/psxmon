@@ -20,8 +20,12 @@ gdbstub = "0.7"
 gdbstub_arch = "0.3"
 miniz_oxide = "0.9.1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "io-std", "sync"] }
 tokio-serial = "5.4"
+
+# ATCONS port I/O (ioperm).
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 lz4_flex = "0.11"

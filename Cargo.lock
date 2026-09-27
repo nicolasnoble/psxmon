@@ -396,6 +396,7 @@ dependencies = [
  "clap",
  "gdbstub",
  "gdbstub_arch",
+ "libc",
  "lz4_flex",
  "miniz_oxide",
  "tempfile",
