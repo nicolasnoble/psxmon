@@ -1,9 +1,13 @@
 # psxmon
 
-Host tool for the PS1 debug monitor (`monitor/` in PCSX-Redux, wire protocol
-version 2, described in `monitor/PROTOCOL.md`). It talks to the monitor over
-SIO1 through a serial port. With it you can upload and run a program, stream
-the program's console text, serve its PCDRV file I/O from a host directory,
+Host tool for the PS1 debug monitor. The monitor is part of
+[nugget](https://github.com/pcsx-redux/nugget), in
+[`monitor/`](https://github.com/pcsx-redux/nugget/tree/main/monitor), not
+of the PCSX-Redux emulator. The release images are built from the nugget
+submodule here. psxmon speaks wire protocol version 2,
+described in `monitor/PROTOCOL.md`. It talks to the monitor through a
+serial port. With it you can upload and run a program, stream the
+program's console text, serve its PCDRV file I/O from a host directory,
 and read or write target memory.
 
 A library (`psxmon`) holds the protocol and the session logic. The `psxmon`
@@ -22,7 +26,8 @@ binary is a thin command line on top of it.
     psxmon patch-h2700 <stock> <monitor> -o FILE
     psxmon mkdisc <exe> -o FILE.bin [--license FILE] [--no-pad]
 
-`--port` may also come from `PSXMON_PORT`. Addresses and lengths take decimal
+`--port DEV` is the serial port the monitor is on (see below), or
+`PSXMON_PORT` when `--port` is left out. Addresses and lengths take decimal
 or `0x` hex.
 
 - `run` loads a program, starts it, and copies its console text to stdout.
@@ -58,6 +63,32 @@ or `0x` hex.
   Sectors 0-15 hold `--license` (an SDK file in 2336-byte sectors or a raw
   image), or zeros without it. `--no-pad` leaves out the 150 blank sectors
   after the volume.
+
+## The port
+
+`DEV` is the host end of the link: a USB serial adapter on the console's
+serial port for the SIO1 images, the FT232H's own serial port for an FT232H
+image (whose `--baud` is ignored), or a pty bridged to an emulator.
+
+    psxmon ping --port /dev/ttyUSB0              # Linux, USB adapter
+    psxmon ping --port /dev/cu.usbserial-A10K1Y  # macOS
+    psxmon ping --port COM3                      # Windows
+    psxmon ping --port COM14                     # Windows, COM10 and above too
+    PSXMON_PORT=/dev/ttyUSB0 psxmon ping         # Linux or macOS
+    $env:PSXMON_PORT = "COM14"; psxmon ping      # Windows PowerShell
+
+On Windows the name is the one Device Manager lists under "Ports (COM &
+LPT)". psxmon adds the `\\.\` device prefix itself, so `COM10` and above
+need nothing special; a name that already starts with `\` (`\\.\COM14`)
+is used as is. On macOS use the `/dev/cu.*` node; `/dev/tty.*` waits for
+carrier detect. On Linux the user needs access to the
+device, usually through the `dialout` or `uucp` group.
+
+For PCSX-Redux, turn on its SIO1 server in raw mode, bridge that to a pty,
+and pass the pty:
+
+    socat PTY,link=/tmp/psx,raw,echo=0 TCP:127.0.0.1:6699 &
+    psxmon run prog.ps-exe --port /tmp/psx
 
 ## Debugging with gdb
 
@@ -134,6 +165,40 @@ code. Other statuses: 124 means the target did not stop before `--timeout`,
 125 means a host, link or protocol error, and 126 means the target stopped
 without exiting (a fault or another breakpoint).
 
+## Release files
+
+Each [release](https://github.com/pcsx-redux/psxmon/releases/latest) carries
+psxmon for three hosts and the monitor images, built from the nugget
+submodule. The links fetch the latest release. In v0.1.0 each disc is a
+loose `.bin` and `.cue`; later releases zip the pair.
+
+| File | What it is | Link | How to use it | Run on hardware |
+|---|---|---|---|---|
+| [`psxmon-linux-x86_64`](https://github.com/pcsx-redux/psxmon/releases/latest/download/psxmon-linux-x86_64) | psxmon, Linux x86_64 | - | `chmod +x`, run | yes |
+| [`psxmon-windows-x86_64.exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/psxmon-windows-x86_64.exe) | psxmon, Windows x86_64 | - | run from a terminal | v0.1.0 fails ([#6](https://github.com/pcsx-redux/psxmon/issues/6)) |
+| [`psxmon-macos-arm64`](https://github.com/pcsx-redux/psxmon/releases/latest/download/psxmon-macos-arm64) | psxmon, macOS arm64 | - | `chmod +x`, run | not run |
+| [`monitor-sio1.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-sio1.ps-exe) | monitor on the retail BIOS | SIO1 | load it with any PS-EXE loader | not recorded |
+| [`monitor-sio1.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-sio1.zip) | disc image of the above (`.bin` + `.cue`) | SIO1 | burn it, boot it | as the `.ps-exe` |
+| [`monitor-sio1-cart.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-sio1-cart.rom) | monitor on the retail BIOS, cartridge | SIO1 | flash a cartridge; boots into the monitor | yes |
+| [`monitor-ft232h-psx232h-a20.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-psx232h-a20.ps-exe) | monitor on the retail BIOS | FT232H, psx232h, A0 on A20 | load it with any PS-EXE loader | no |
+| [`monitor-ft232h-psx232h-a20.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-psx232h-a20.zip) | disc image of the above | FT232H, psx232h, A0 on A20 | burn it, boot it | as the `.ps-exe` |
+| [`monitor-ft232h-psx232h-a0.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-psx232h-a0.ps-exe) | monitor on the retail BIOS | FT232H, psx232h, A0 on A0 | load it with any PS-EXE loader | no |
+| [`monitor-ft232h-psx232h-a0.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-psx232h-a0.zip) | disc image of the above | FT232H, psx232h, A0 on A0 | burn it, boot it | as the `.ps-exe` |
+| [`monitor-ft232h-picodev-usb.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-picodev-usb.ps-exe) | monitor on the retail BIOS | FT232H, Pico-Dev, USB channel | load it with any PS-EXE loader | reported working |
+| [`monitor-ft232h-picodev-usb.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-picodev-usb.zip) | disc image of the above | FT232H, Pico-Dev, USB channel | burn it, boot it | as the `.ps-exe` |
+| [`monitor-ft232h-picodev-uart.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-picodev-uart.ps-exe) | monitor on the retail BIOS | FT232H, Pico-Dev, UART channel | load it with any PS-EXE loader | no |
+| [`monitor-ft232h-picodev-uart.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-picodev-uart.zip) | disc image of the above | FT232H, Pico-Dev, UART channel | burn it, boot it | as the `.ps-exe` |
+| [`monitor-ft232h-piodev-lite.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-piodev-lite.ps-exe) | monitor on the retail BIOS | FT232H, PIO-Dev-Lite | load it with any PS-EXE loader | no |
+| [`monitor-ft232h-piodev-lite.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-piodev-lite.zip) | disc image of the above | FT232H, PIO-Dev-Lite | burn it, boot it | as the `.ps-exe` |
+| [`openbios-sio1-cart.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-sio1-cart.rom) | OpenBIOS with the monitor, cartridge | SIO1 | flash a cartridge; OpenBIOS takes over at boot | Redux only |
+| [`openbios-sio1.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-sio1.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | SIO1 | program a replacement BIOS chip | Redux only |
+| [`openbios-ft232h-psx232h-a20.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-psx232h-a20.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, psx232h, A0 on A20 | program a replacement BIOS chip | no |
+| [`openbios-ft232h-psx232h-a0.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-psx232h-a0.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, psx232h, A0 on A0 | program a replacement BIOS chip | no |
+| [`openbios-ft232h-picodev-usb.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-picodev-usb.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, Pico-Dev, USB channel | program a replacement BIOS chip | no |
+| [`openbios-ft232h-picodev-uart.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-picodev-uart.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, Pico-Dev, UART channel | program a replacement BIOS chip | no |
+| [`openbios-ft232h-piodev-lite.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-piodev-lite.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, PIO-Dev-Lite | program a replacement BIOS chip | no |
+| [`openbios-atcons-h2700.elf`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-atcons-h2700.elf) | OpenBIOS with the monitor, for the DTL-H2700 | ATCONS | `psxmon patch-h2700`, flash, reset mode 7; psxmon has no ATCONS link yet ([#3](https://github.com/pcsx-redux/psxmon/issues/3)) | yes |
+
 ## Build
 
     cargo build --release
@@ -149,6 +214,17 @@ The tests run the session against a simulated monitor
 PCDRV and exit breaks or a small R3000 interpreter with a ROM and the cop0
 debug unit. `tests/gdb` drives `psxmon gdb` against it in raw RSP; with
 `PSXMON_GDB_E2E=1` it also runs `gdb-multiarch --batch` against it.
+
+## Discord
+
+PCSX-Redux's server, for psxmon, the monitor and nugget:
+
+[![Discord](https://discord.com/api/guilds/567975889879695361/widget.png?style=banner2)](https://discord.gg/KG5uCqw)
+
+The PSX.Dev server, for PlayStation 1 development, hacking and reverse
+engineering in general:
+
+[![Discord](https://discord.com/api/guilds/642647820683444236/widget.png?style=banner2)](https://discord.gg/QByKPpH)
 
 ## License
 
