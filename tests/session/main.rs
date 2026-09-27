@@ -434,3 +434,64 @@ async fn elf_and_cpe_images_load_and_run() {
     s.run(img.pc, img.gp, img.sp).await.expect("RUN");
     assert_eq!(run_until_stop(&mut s, 5, None).await.exit_code, Some(5));
 }
+
+/// The RAM probe on 2, 4 and 8 MiB, with the words 2, 4 and 6 MiB above
+/// the sentinel made equal to it by chance, and the sentinel restored.
+#[tokio::test]
+async fn ram_probe_finds_installed_size() {
+    const MIB: usize = 1 << 20;
+    for size in [2 * MIB, 4 * MIB, 8 * MIB] {
+        for chance in [false, true] {
+            let cfg = SimConfig {
+                ram_size: size,
+                ..Default::default()
+            };
+            let (mut s, stats) = attach(cfg, Box::new(Hang)).await;
+            let v: u32 = 0x1234_5678;
+            s.write_mem(0xa000_0000, &v.to_le_bytes())
+                .await
+                .expect("seed");
+            if chance {
+                for off in [0x20_0000u32, 0x40_0000, 0x60_0000] {
+                    s.write_mem(0xa000_0000 + off, &v.to_le_bytes())
+                        .await
+                        .expect("seed mirror");
+                }
+            }
+            let mark = lock(&stats).cmds.len();
+            let got = s.probe_ram().await.expect("probe");
+            assert_eq!(
+                got,
+                u32::try_from(size).expect("fits"),
+                "{size} chance={chance}"
+            );
+            let back = s.read_mem(0xa000_0000, 4).await.expect("read back");
+            assert_eq!(back, v.to_le_bytes(), "sentinel restored");
+            // Once per session.
+            let n = lock(&stats).cmds.len();
+            assert_eq!(s.probe_ram().await.expect("again"), got);
+            assert_eq!(lock(&stats).cmds.len(), n, "no second probe");
+            let writes = lock(&stats).cmds[mark..n]
+                .iter()
+                .filter(|&&c| c == WRITE_MEM)
+                .count();
+            // 8 MiB with nothing equal above the sentinel needs no flip.
+            let flips = if size == 8 * MIB && !chance { 0 } else { 2 };
+            assert_eq!(writes, flips, "{size} chance={chance}");
+        }
+    }
+}
+
+/// A first DRAM bank smaller than the window (DRAM_CTRL 0x888): nothing
+/// mirrors, and nothing is probed above it.
+#[tokio::test]
+async fn ram_probe_skips_a_small_bank() {
+    let cfg = SimConfig {
+        ram_size_reg: 0x888,
+        ..Default::default()
+    };
+    let (mut s, stats) = attach(cfg, Box::new(Hang)).await;
+    let mark = lock(&stats).cmds.len();
+    assert_eq!(s.probe_ram().await.expect("probe"), 8 << 20);
+    assert_eq!(lock(&stats).cmds[mark..], [READ_MEM]);
+}

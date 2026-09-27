@@ -13,6 +13,7 @@ pub mod lz4;
 pub mod mips;
 pub mod pcdrv;
 pub mod proto;
+pub mod ram;
 pub mod session;
 pub mod transport;
 

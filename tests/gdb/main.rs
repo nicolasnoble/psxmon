@@ -133,8 +133,14 @@ struct Rig {
 /// A sim running `words`, a MonTarget over it halted at the entry, and a
 /// server thread waiting for one gdb connection.
 fn rig(words: &[u32]) -> Rig {
+    rig_with(words, sim::RAM_SIZE)
+}
+
+/// [`rig`] with `ram` bytes of RAM installed.
+fn rig_with(words: &[u32], ram: usize) -> Rig {
     let cfg = SimConfig {
         rom: rom(),
+        ram_size: ram,
         ..Default::default()
     };
     // The sim gets a thread and runtime of its own; the server's runtime is
@@ -333,8 +339,9 @@ fn rsp_registers_memory_breakpoints_steps_pcdrv_exit() {
             "{:x?}",
             st.set_bps
         );
+        // 2 MiB installed: the mask leaves out bits 21-22, the mirrors.
         assert!(
-            st.set_bps.contains(&(2, DATA, 0x1fff_fffc)),
+            st.set_bps.contains(&(2, DATA, 0x1f9f_fffc)),
             "{:x?}",
             st.set_bps
         );
@@ -435,6 +442,56 @@ fn rsp_detach_leaves_target_halted() {
     assert_eq!(code, None);
     let st = rig.stats.lock().expect("stats");
     assert_eq!(st.cmds.last(), Some(&WRITE_MEM), "no CONT after detach");
+}
+
+/// Stores a word at 0x80200100, 2 MiB above 0x80000100, then exits 42.
+fn mirror_store_program() -> Vec<u32> {
+    vec![
+        lui(T0, 0x8020),
+        addiu(T1, ZERO, 7),
+        sw(T1, 0x100, T0), // 08
+        addiu(A0, ZERO, 42),
+        brk(4, 0),
+    ]
+}
+
+/// A watch on 0x80000100 fires on a store through its mirror 0x80200100
+/// when 2 MiB is installed, and not when 8 MiB is (no mirror there).
+#[test]
+fn rsp_watch_matches_ram_mirrors() {
+    let rig = rig_with(&mirror_store_program(), 2 << 20);
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    assert_eq!(g.cmd("Z2,80000100,4"), "OK");
+    let r = g.cmd("c");
+    assert!(r.starts_with("T05") && r.contains("watch:80000100"), "{r}");
+    assert_eq!(g.pc(), BASE + 0x08);
+    {
+        let st = rig.stats.lock().expect("stats");
+        assert!(
+            st.set_bps.contains(&(2, 0x8000_0100, 0x1f9f_fffc)),
+            "{:x?}",
+            st.set_bps
+        );
+    }
+    // The sentinel the probe flipped is back.
+    assert_eq!(g.cmd("ma0000000,4"), "00000000");
+    assert_eq!(g.cmd("D"), "OK");
+    rig.server.join().expect("server thread");
+
+    let rig = rig_with(&mirror_store_program(), 8 << 20);
+    let mut g = Rsp::connect(rig.port);
+    g.cmd("qSupported:swbreak+");
+    assert_eq!(g.cmd("Z2,80000100,4"), "OK");
+    assert_eq!(g.cmd("c"), "W2a");
+    let (_, code) = rig.server.join().expect("server thread");
+    assert_eq!(code, Some(42));
+    let st = rig.stats.lock().expect("stats");
+    assert!(
+        st.set_bps.contains(&(2, 0x8000_0100, 0x1fff_fffc)),
+        "{:x?}",
+        st.set_bps
+    );
 }
 
 /// Console text printed while the target runs reaches gdb as `O` packets

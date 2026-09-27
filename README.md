@@ -168,7 +168,14 @@ Use it with `gdb-multiarch` or any `mips` gdb:
   unit compares the address the CPU issues, so a word store that covers a
   watched byte at another address does not trigger it.
 - Breakpoints and the watch match an address in all three segments (the
-  compare mask leaves out bits 29-31). A hardware stop disarms the whole
+  compare mask leaves out bits 29-31), and in RAM every mirror of it: the
+  BIOS maps 8 MiB of addresses to RAM, over which 2 MiB repeats four
+  times and 4 MiB twice, so the mask also leaves out the bits between the
+  installed size and 8 MiB. psxmon finds the installed size the first time
+  it arms a breakpoint in RAM, by flipping the word at physical 0 and
+  reading it back 2, 4 and 6 MiB up (the word is put back), and skips
+  that when the program has shrunk the first DRAM bank below 8 MiB
+  (DRAM_CTRL at 0x1f801060), where nothing repeats. A hardware stop disarms the whole
   debug unit, so psxmon re-arms it with SET_BP before every CONT, and turns
   it off after every other stop so the monitor's own memory accesses cannot
   trip it.
