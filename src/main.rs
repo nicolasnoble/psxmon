@@ -53,7 +53,7 @@ struct Link {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Program to run (PS-EXE, ELF or CPE).
+    /// Program to run (PS-EXE, ELF, CPE or PSF).
     file: PathBuf,
     #[command(flatten)]
     link: Link,
@@ -79,7 +79,7 @@ struct RunArgs {
 
 #[derive(Args)]
 struct GdbArgs {
-    /// Program to load (PS-EXE, ELF or CPE); gdb finds it halted on its
+    /// Program to load (PS-EXE, ELF, CPE or PSF); gdb finds it halted on its
     /// first instruction. Without it, gdb attaches to whatever program the
     /// monitor has halted.
     file: Option<PathBuf>,

@@ -30,10 +30,16 @@ or `0x` hex.
   to that directory. Without `--pcdrv`, every PCDRV call fails with -1. The
   run ends when the program executes `break 4, 0`, with its exit code in
   `a0`.
-- Programs can be PS-EXE, ELF or CPE, told apart by their magic. An ELF
+- Programs can be PS-EXE, ELF, CPE or PSF, told apart by their magic. An ELF
   loads its PT_LOAD segments at their physical addresses, minus the header
   sections, and starts at `e_entry` with gp from `_gp`. A CPE loads its load
   chunks and starts at register 0x90. ELF and CPE get sp 0x801FFF00.
+- PSF (version 0x01) and MiniPSF load as PCSX-Redux loads them: `_lib`
+  first, then the file's own PS-EXE, then `_lib2`, `_lib3`, ..., with
+  library paths relative to the file naming them. pc and sp (`s_addr`,
+  0x801FFFF0 if zero) come from the first PS-EXE loaded, so a MiniPSF
+  starts at its library's entry point. Missing libraries are skipped with a
+  warning.
 - LZ4 is used when the monitor advertises it and it shrinks the program. The
   compressor caps every match at `--max-match` bytes, because the monitor
   decodes while it receives and cannot pause the sender inside a frame.
