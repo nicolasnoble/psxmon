@@ -5,7 +5,7 @@ Host tool for the PS1 debug monitor. The monitor is part of
 [`monitor/`](https://github.com/pcsx-redux/nugget/tree/main/monitor), not
 of the PCSX-Redux emulator. The release images are built from the nugget
 submodule here. psxmon speaks wire protocol version 2,
-described in `monitor/PROTOCOL.md`. It talks to the monitor through a
+described in [`monitor/PROTOCOL.md`](https://github.com/pcsx-redux/nugget/blob/main/monitor/PROTOCOL.md). It talks to the monitor through a
 serial port, or through the DTL-H2700's ISA card (ATCONS). With it you can upload and run a program, stream the
 program's console text, serve its PCDRV file I/O from a host directory,
 and read or write target memory.
