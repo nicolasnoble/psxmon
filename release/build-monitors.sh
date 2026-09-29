@@ -14,6 +14,9 @@
 #                                   flash cartridge, monitor on SIO1
 #   openbios-sio1.rom               OpenBIOS as the console's BIOS ROM, SIO1
 #   openbios-ft232h-<board>.rom     same, FT232H on the expansion port
+#   openbios-ft232h-<board>-cart.rom  OpenBIOS from a flash cartridge that also
+#                                   carries the FT232H, for boards that decode
+#                                   it clear of the flash
 #   openbios-atcons-h2700.elf       OpenBIOS for the H2700 code cave; turn it
 #                                   into a flash image with psxmon patch-h2700
 # Disc images of the PS-EXEs come from psxmon mkdisc, zipped as .bin + .cue,
@@ -60,6 +63,12 @@ cp "$nugget/openbios/openbios.bin" "$out/openbios-sio1.rom"
 for board in psx232h-a20 psx232h-a0 picodev-usb picodev-uart piodev-lite orion; do
     openbios BOOT=rom MONITOR_LINK=FT232H MONITOR_FT232H_BOARD="$board"
     cp "$nugget/openbios/openbios.bin" "$out/openbios-ft232h-$board.rom"
+done
+# PIO-Dev-Lite: flash on /CS0 Y0, FT232H on Y1 at 0x1f200000. Link init only
+# widens EXP1, the timing the flash runs at is unchanged.
+for board in piodev-lite; do
+    openbios BOOT=cart MONITOR_LINK=FT232H MONITOR_FT232H_BOARD="$board"
+    cp "$nugget/openbios/openbios.bin" "$out/openbios-ft232h-$board-cart.rom"
 done
 
 openbios BOOT=cart

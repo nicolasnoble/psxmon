@@ -8,6 +8,7 @@ Monitor on the retail BIOS kernel:
 OpenBIOS with the monitor:
 - `openbios-sio1-cart.rom`: flash cartridge image; OpenBIOS takes over from the retail BIOS at boot and runs the monitor on the serial port.
 - `openbios-sio1.rom`, `openbios-ft232h-<board>.rom`: 512 KiB BIOS ROM images, for a console with a replaced BIOS chip.
+- `openbios-ft232h-piodev-lite-cart.rom`: flash image for the PIO-Dev-Lite; OpenBIOS takes over at boot and runs the monitor over the cart's FT232H.
 - `openbios-atcons-h2700.elf`: for the H2700 dev board. `psxmon patch-h2700 stock.bin openbios-atcons-h2700.elf -o flash.bin` puts it into a dump of the board's own flash, or the same command with the FLASH27 kit's `H2700.IMG` in place of `stock.bin` patches that directly; reset mode 7 boots the monitor, any other mode the stock BIOS.
 
 Run on real hardware: `monitor-sio1-cart.rom` (earlier build; this one adds the exception-slot hook and STOP, tested in PCSX-Redux). Run in PCSX-Redux only: the OpenBIOS SIO1 cart and ROM. The H2700 image ran on the board in its v0.1.0 form; this build's monitor has not. Reported working on hardware by a user: a Pico-Dev FT232H image (`monitor-ft232h-picodev-usb`), and the Orion cart image (`monitor-ft232h-orion`) on a SCPH-1001 and a SCPH-7502. Not run anywhere: every other FT232H image.
