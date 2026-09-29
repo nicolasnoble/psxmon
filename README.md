@@ -259,6 +259,8 @@ submodule. The links fetch the latest release.
 | [`monitor-ft232h-picodev-uart.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-picodev-uart.zip) | disc image of the above | FT232H, Pico-Dev, UART channel | burn it, boot it | as the `.ps-exe` |
 | [`monitor-ft232h-piodev-lite.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-piodev-lite.ps-exe) | monitor on the retail BIOS | FT232H, PIO-Dev-Lite | load it with any PS-EXE loader | no |
 | [`monitor-ft232h-piodev-lite.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-piodev-lite.zip) | disc image of the above | FT232H, PIO-Dev-Lite | burn it, boot it | as the `.ps-exe` |
+| [`monitor-ft232h-orion.ps-exe`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-orion.ps-exe) | monitor on the retail BIOS | FT232H-style link, Orion cart | load it with any PS-EXE loader | SCPH-1001, SCPH-7502 |
+| [`monitor-ft232h-orion.zip`](https://github.com/pcsx-redux/psxmon/releases/latest/download/monitor-ft232h-orion.zip) | disc image of the above | FT232H-style link, Orion cart | burn it, boot it | as the `.ps-exe` |
 | [`openbios-sio1-cart.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-sio1-cart.rom) | OpenBIOS with the monitor, cartridge | SIO1 | flash a cartridge; OpenBIOS takes over at boot | Redux only |
 | [`openbios-sio1.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-sio1.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | SIO1 | program a replacement BIOS chip | Redux only |
 | [`openbios-ft232h-psx232h-a20.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-psx232h-a20.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, psx232h, A0 on A20 | program a replacement BIOS chip | no |
@@ -266,6 +268,7 @@ submodule. The links fetch the latest release.
 | [`openbios-ft232h-picodev-usb.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-picodev-usb.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, Pico-Dev, USB channel | program a replacement BIOS chip | no |
 | [`openbios-ft232h-picodev-uart.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-picodev-uart.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, Pico-Dev, UART channel | program a replacement BIOS chip | no |
 | [`openbios-ft232h-piodev-lite.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-piodev-lite.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H, PIO-Dev-Lite | program a replacement BIOS chip | no |
+| [`openbios-ft232h-orion.rom`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-ft232h-orion.rom) | OpenBIOS with the monitor, 512 KiB BIOS ROM | FT232H-style link, Orion cart | program a replacement BIOS chip | no |
 | [`openbios-atcons-h2700.elf`](https://github.com/pcsx-redux/psxmon/releases/latest/download/openbios-atcons-h2700.elf) | OpenBIOS with the monitor, for the DTL-H2700 | ATCONS | `psxmon patch-h2700`, flash, reset mode 7; psxmon has no ATCONS link yet ([#3](https://github.com/pcsx-redux/psxmon/issues/3)) | yes |
 
 ## Build
