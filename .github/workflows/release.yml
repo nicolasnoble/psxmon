@@ -1,5 +1,4 @@
 name: Release
-# cspell:ignore psxmon
 
 on:
   push:
