@@ -1,4 +1,5 @@
 name: Release
+# cspell:ignore psxmon
 
 on:
   push:
@@ -76,7 +77,12 @@ jobs:
           path: out/
 
   release:
-    needs: [monitors, psxmon]
+    needs: [version-check, monitors, psxmon]
+    if: >-
+      !cancelled() &&
+      needs.monitors.result == 'success' &&
+      needs.psxmon.result == 'success' &&
+      (needs.version-check.result == 'success' || needs.version-check.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
