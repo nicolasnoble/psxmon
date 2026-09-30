@@ -27,6 +27,8 @@ jobs:
 
   monitors:
     runs-on: ubuntu-latest
+    needs: [version-check]
+    if: ${{ !cancelled() && (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') }}
     container: ghcr.io/grumpycoders/pcsx-redux-build:latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +57,8 @@ jobs:
             name: psxmon-macos-arm64
             exe: psxmon
     runs-on: ${{ matrix.os }}
+    needs: [version-check]
+    if: ${{ !cancelled() && (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') }}
     steps:
       - uses: actions/checkout@v4
       - name: Install libudev
@@ -72,8 +76,7 @@ jobs:
           path: out/
 
   release:
-    needs: [monitors, psxmon, version-check]
-    if: ${{ !cancelled() && needs.monitors.result == 'success' && needs.psxmon.result == 'success' && (needs.version-check.result == 'success' || needs.version-check.result == 'skipped') }}
+    needs: [monitors, psxmon]
     runs-on: ubuntu-latest
     permissions:
       contents: write
