@@ -31,6 +31,11 @@ const RATE_WINDOW: Duration = Duration::from_millis(2500);
 
 const SHORT: Duration = Duration::from_secs(2);
 const BULK: Duration = Duration::from_secs(5);
+/// Bulk frames in flight when the monitor has [`CAP_PIPELINE`]: frames go out
+/// ahead of their ACKs, so an ACK's trip back (an FTDI's 16 ms latency timer)
+/// overlaps the next transfers instead of idling the link. 4 x 8 KiB covers
+/// that timer at FT232H rates; 1 (no pipelining) otherwise.
+const PIPELINE: usize = 4;
 
 /// `now + d`, or far in the future if that does not fit.
 pub fn deadline_after(d: Duration) -> Instant {
@@ -60,6 +65,8 @@ pub enum SessionError {
     TooLarge(&'static str),
     #[error("monitor: {0}")]
     Other(String),
+    #[error("monitor: link out of step after a failed {0}; PING to resynchronise")]
+    OutOfStep(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
@@ -181,6 +188,10 @@ pub struct Session<T: Transport> {
     hw_live: bool,
     /// What [`Session::probe_ram`] found, once it has run.
     ram_size: Option<u32>,
+    /// Set when a pipelined transfer failed with replies unaccounted for:
+    /// one of them could answer a later request, so only PING is sent
+    /// until a PONG resynchronises the link.
+    out_of_step: Option<String>,
 }
 
 impl<T: Transport> Session<T> {
@@ -199,6 +210,7 @@ impl<T: Transport> Session<T> {
             hw: HwBreaks::default(),
             hw_live: false,
             ram_size: None,
+            out_of_step: None,
         }
     }
 
@@ -227,6 +239,11 @@ impl<T: Transport> Session<T> {
     }
 
     pub async fn send(&mut self, ty: u16, payload: &[u16]) -> Result<()> {
+        if ty != PING
+            && let Some(what) = &self.out_of_step
+        {
+            return Err(SessionError::OutOfStep(what.clone()));
+        }
         self.io.write_all(&encode_frame(ty, payload)?).await?;
         self.io.flush().await?;
         Ok(())
@@ -291,6 +308,8 @@ impl<T: Transport> Session<T> {
             if let Some(pong) = self.wait_frame(&[PONG], slot).await?
                 && pong.ok
             {
+                // Anything a lost reply left in flight came before the PONG.
+                self.out_of_step = None;
                 if let Some(&v) = pong.words.first() {
                     self.version = Some(v);
                 }
@@ -331,7 +350,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Write `data` at `addr` in plain LOAD frames of 8 KiB, each ACKed
-    /// before the next.
+    /// before the next, or pipelined as for [`Session::load_lz4`].
     pub async fn load_raw(&mut self, addr: u32, data: &[u8]) -> Result<()> {
         self.bulk_write(LOAD, "LOAD", addr, data).await
     }
@@ -341,8 +360,66 @@ impl<T: Transport> Session<T> {
         self.bulk_write(WRITE_MEM, "WRITE_MEM", addr, data).await
     }
 
+    fn pipeline_depth(&self) -> usize {
+        if self.caps & CAP_PIPELINE != 0 {
+            PIPELINE
+        } else {
+            1
+        }
+    }
+
+    /// Report upload progress, if anyone is listening.
+    fn report_progress(&mut self, done: usize, total: usize) {
+        if let Some(p) = self.progress.as_mut() {
+            p(done, total);
+        }
+    }
+
+    /// After a pipelined transfer fails with `in_flight` frames still
+    /// unanswered, read their replies back, so that none of them is taken
+    /// for a later request's. If they cannot all be accounted for (a reply
+    /// timed out, the link failed), the session is put out of step. Returns
+    /// `r` as it was.
+    async fn settle(&mut self, r: Result<()>, in_flight: usize, what: &str) -> Result<()> {
+        let Err(e) = r else { return Ok(()) };
+        if in_flight == 0 {
+            return Err(e);
+        }
+        // A timed-out reply may still come, a failed link may have cut a
+        // frame short: what follows cannot be matched up.
+        let mut known = matches!(e, SessionError::Monitor { .. } | SessionError::Checksum(_));
+        for _ in 0..in_flight {
+            if !known {
+                break;
+            }
+            known = matches!(
+                self.wait_frame(&[ACK, ERROR], deadline_after(BULK)).await,
+                Ok(Some(_))
+            );
+        }
+        if !known {
+            self.out_of_step = Some(what.to_owned());
+        }
+        Err(e)
+    }
+
     async fn bulk_write(&mut self, ty: u16, name: &str, addr: u32, data: &[u8]) -> Result<()> {
         u32_len(data.len(), "write length")?;
+        // Frames sent but not yet ACKed: their address and the bytes sent
+        // once they are, so progress is reported per ACK, not per send.
+        let mut pending = VecDeque::new();
+        let r = self.bulk_frames(ty, name, addr, data, &mut pending).await;
+        self.settle(r, pending.len(), name).await
+    }
+
+    async fn bulk_frames(
+        &mut self,
+        ty: u16,
+        name: &str,
+        addr: u32,
+        data: &[u8],
+        pending: &mut VecDeque<(u32, usize)>,
+    ) -> Result<()> {
         let mut at = addr;
         let mut sent: usize = 0;
         for chunk in data.chunks(CHUNK_BYTES) {
@@ -350,39 +427,75 @@ impl<T: Transport> Session<T> {
             let mut payload = u32_words(&[at, n]);
             payload.extend(bytes_to_words(chunk));
             self.send(ty, &payload).await?;
-            self.expect_ack(|| format!("{name} at 0x{at:08x}"), BULK)
-                .await?;
             sent = sent.saturating_add(chunk.len());
-            if ty == LOAD
-                && let Some(p) = self.progress.as_mut()
+            pending.push_back((at, sent));
+            if pending.len() >= self.pipeline_depth()
+                && let Some((a, done)) = pending.pop_front()
             {
-                p(sent, data.len());
+                self.expect_ack(|| format!("{name} at 0x{a:08x}"), BULK)
+                    .await?;
+                if ty == LOAD {
+                    self.report_progress(done, data.len());
+                }
             }
             // Target addresses are 32-bit and wrap, as `addr + off` does
             // once the reference host packs it into two words.
             at = at.wrapping_add(n);
         }
+        while let Some((a, done)) = pending.pop_front() {
+            self.expect_ack(|| format!("{name} at 0x{a:08x}"), BULK)
+                .await?;
+            if ty == LOAD {
+                self.report_progress(done, data.len());
+            }
+        }
         Ok(())
     }
 
     /// Write `raw_len` bytes at `addr` from the LZ4 block `comp`, sent as
-    /// consecutive slices in LOAD|LZ4 frames, each ACKed before the next.
+    /// consecutive slices in LOAD|LZ4 frames, each ACKed before the next, or
+    /// up to 4 in flight ahead of their ACKs when the monitor has
+    /// [`CAP_PIPELINE`].
     pub async fn load_lz4(&mut self, addr: u32, raw_len: usize, comp: &[u8]) -> Result<()> {
         let raw_len = u32_len(raw_len, "LZ4 raw length")?;
         let clen = u32_len(comp.len(), "LZ4 block")?;
+        // Frames sent but not yet ACKed: their offset and length.
+        let mut pending = VecDeque::new();
+        let r = self
+            .lz4_frames(addr, raw_len, clen, comp, &mut pending)
+            .await;
+        self.settle(r, pending.len(), "LZ4 LOAD").await
+    }
+
+    async fn lz4_frames(
+        &mut self,
+        addr: u32,
+        raw_len: u32,
+        clen: u32,
+        comp: &[u8],
+        pending: &mut VecDeque<(u32, u32)>,
+    ) -> Result<()> {
         let mut off: u32 = 0;
         for chunk in comp.chunks(CHUNK_BYTES) {
             let n = u32_len(chunk.len(), "chunk")?;
             let mut payload = u32_words(&[addr, raw_len, clen, off, n]);
             payload.extend(bytes_to_words(chunk));
             self.send(LOAD | LZ4_FLAG, &payload).await?;
-            self.expect_ack(|| format!("LZ4 LOAD at offset {off}"), BULK)
-                .await?;
-            if let Some(p) = self.progress.as_mut() {
-                p(to_usize(off.saturating_add(n))?, comp.len());
+            pending.push_back((off, n));
+            if pending.len() >= self.pipeline_depth()
+                && let Some((o, len)) = pending.pop_front()
+            {
+                self.expect_ack(|| format!("LZ4 LOAD at offset {o}"), BULK)
+                    .await?;
+                self.report_progress(to_usize(o.saturating_add(len))?, comp.len());
             }
             // off + n <= clen, a u32.
             off = off.saturating_add(n);
+        }
+        while let Some((o, len)) = pending.pop_front() {
+            self.expect_ack(|| format!("LZ4 LOAD at offset {o}"), BULK)
+                .await?;
+            self.report_progress(to_usize(o.saturating_add(len))?, comp.len());
         }
         Ok(())
     }
