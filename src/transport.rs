@@ -77,8 +77,11 @@ pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {
 /// command queue again: the most a write waits on an idle link.
 const POLL: Duration = Duration::from_millis(2);
 
-/// The most the I/O thread writes before it drains what has arrived.
-const WRITE_CHUNK: usize = 256;
+/// The most the I/O thread writes before it drains what has arrived. Picked
+/// by loading a 1.8 MB PS-EXE over an FT232H: on Linux a whole bulk frame
+/// per write is 13% faster than 256 or 4096 bytes; on Windows 256 is the
+/// fastest of the three.
+const WRITE_CHUNK: usize = if cfg!(windows) { 256 } else { 16384 };
 
 enum Cmd {
     Write(Vec<u8>),
@@ -101,6 +104,7 @@ pub struct SerialTransport {
     flush: Option<oneshot::Receiver<()>>,
     thread: Option<JoinHandle<()>>,
     baud: u32,
+    _timer: FineTimer,
 }
 
 impl SerialTransport {
@@ -135,6 +139,7 @@ impl SerialTransport {
             flush: None,
             thread: Some(thread),
             baud,
+            _timer: FineTimer::new(),
         })
     }
 
@@ -143,6 +148,46 @@ impl SerialTransport {
             .as_ref()
             .and_then(|q| q.send(c).ok())
             .ok_or_else(closed)
+    }
+}
+
+/// 1 ms Windows timer ticks while a serial port is open. At the default
+/// 15.6 ms tick the I/O thread's [`POLL`] read timeout lasts a whole tick,
+/// and each bulk frame waits that long behind it: loads over an FT232H ran
+/// at ~530 kB/s with the default tick and ~990 kB/s with this. Nothing on
+/// other systems.
+struct FineTimer {
+    #[cfg(windows)]
+    set: bool,
+}
+
+impl FineTimer {
+    #[cfg(windows)]
+    fn new() -> Self {
+        // SAFETY: a plain Win32 call with no pointers, undone in Drop.
+        let r = unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+        link_log(&format!(
+            "timer period 1 ms: {}",
+            if r == 0 { "set" } else { "refused" }
+        ));
+        FineTimer { set: r == 0 }
+    }
+
+    #[cfg(not(windows))]
+    fn new() -> Self {
+        FineTimer {}
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        if self.set {
+            // SAFETY: ends the request `new` made.
+            unsafe {
+                windows_sys::Win32::Media::timeEndPeriod(1);
+            }
+        }
     }
 }
 
