@@ -201,6 +201,9 @@ pub struct SimConfig {
     /// Host bytes lost on the way in, by position in the stream the sim
     /// reads (0 = the first byte), as a FIFO read that misses one would.
     pub drop_host_bytes: Vec<usize>,
+    /// Answer LZ4 LOAD slices with EBADCMD from this many slices on, as a
+    /// System 573 monitor does above 518400 baud (Some(0): every slice).
+    pub refuse_lz4_from: Option<usize>,
 }
 
 impl Default for SimConfig {
@@ -216,6 +219,7 @@ impl Default for SimConfig {
             ram_size: RAM_SIZE,
             ram_size_reg: RAM_SIZE_BIOS,
             drop_host_bytes: Vec::new(),
+            refuse_lz4_from: None,
         }
     }
 }
@@ -225,6 +229,8 @@ impl Default for SimConfig {
 pub struct SimStats {
     pub lz4_frames: usize,
     pub plain_load_frames: usize,
+    /// LZ4 slices answered with EBADCMD under `refuse_lz4_from`.
+    pub lz4_refused: usize,
     pub max_match: usize,
     pub errors_sent: Vec<u16>,
     pub rate: u32,
@@ -232,6 +238,8 @@ pub struct SimStats {
     pub cmds: Vec<u16>,
     /// SET_BP payloads: (kind, addr, mask).
     pub set_bps: Vec<(u16, u32, u32)>,
+    /// RUN payloads, in order.
+    pub runs: Vec<Vec<u16>>,
 }
 
 #[derive(Default)]
@@ -447,6 +455,12 @@ impl Sim {
                 let bytes = words_to_bytes(w, 4, n.min(avail));
                 self.m.write(addr, &bytes); // before the checksum is known
                 if ok { 0 } else { E_CKSUM }
+            } else if self.cfg.refuse_lz4_from.is_some_and(|from| {
+                let st = self.stats();
+                st.lz4_frames.saturating_add(st.lz4_refused) >= from
+            }) {
+                self.count(|st| &mut st.lz4_refused);
+                E_BADCMD
             } else if self.cfg.caps & CAP_LZ4 != 0 {
                 self.lz4_slice(w, ok)
             } else {
@@ -497,6 +511,7 @@ impl Sim {
                 self.send_status(code).await;
             }
             RUN => {
+                self.stats().runs.push(w.to_vec());
                 self.m.regs = [0; NUM_REGS];
                 self.m.set(GP, word_u32(w, 2));
                 self.m.set(SP, word_u32(w, 4));
