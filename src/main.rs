@@ -977,9 +977,10 @@ fn write_png(path: &Path, rgb: &[u8], crop: Crop) -> Result<()> {
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), crop.w, crop.h);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()?
-        .write_image_data(rgb)
-        .with_context(|| format!("writing {}", path.display()))
+    let ctx = || format!("writing {}", path.display());
+    let mut writer = enc.write_header().with_context(ctx)?;
+    writer.write_image_data(rgb).with_context(ctx)?;
+    writer.finish().with_context(ctx)
 }
 
 async fn getvram(
